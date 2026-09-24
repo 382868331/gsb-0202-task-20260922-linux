@@ -72,6 +72,46 @@ def reference_fit(src, tgt, lam=0.0):
     return sx[:n], sy[:n], sx[n:], sy[n:], pts
 
 
+def reference_fit_weighted(src, tgt, lam, sigmas):
+    """Weighted smoothing spline via an independent from-scratch assembly.
+
+    Solves the joint stationarity system
+    ``[K + diag(lam/sigma_i)  P; P^T 0] [w; a] = [v; 0]`` directly (no
+    normalisation), so it shares no code path with the package.  Every
+    confidence weight must be strictly positive; the sigma = 0 limit is
+    checked separately by deleting the point.  Returns the same tuple
+    layout as `reference_fit`.
+    """
+    seen = {}
+    sw = {}
+    for s, t, sg in zip(src, tgt, sigmas):
+        key = (float(s[0]), float(s[1]))
+        tv = (float(t[0]), float(t[1]))
+        if key in seen:
+            assert seen[key] == tv
+            sw[key] += float(sg)
+            continue
+        seen[key] = tv
+        sw[key] = float(sg)
+    pts = list(seen.keys())
+    n = len(pts)
+    size = n + 3
+    a = [[0.0] * size for _ in range(size)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            kij = kernel(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1])
+            a[i][j] = a[j][i] = kij
+        a[i][i] = float(lam) / sw[pts[i]]
+        a[i][n] = a[n][i] = 1.0
+        a[i][n + 1] = a[n + 1][i] = pts[i][0]
+        a[i][n + 2] = a[n + 2][i] = pts[i][1]
+    bx = [seen[p][0] for p in pts] + [0.0, 0.0, 0.0]
+    by = [seen[p][1] for p in pts] + [0.0, 0.0, 0.0]
+    sx = gauss_solve(a, bx)
+    sy = gauss_solve(a, by)
+    return sx[:n], sy[:n], sx[n:], sy[n:], pts
+
+
 def reference_warp(params, x, y):
     wx, wy, ax, ay, pts = params
     ox = ax[0] + ax[1] * x + ax[2] * y

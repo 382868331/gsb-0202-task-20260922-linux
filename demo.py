@@ -2,16 +2,23 @@
 
 Run with:  python demo.py
 
-It really fits a thin-plate spline to a deterministic 4x4 grid (no network,
-no sleep, no pre-recorded output), prints a normal deformation result and
-then triggers a genuine contract rejection (duplicate source point mapping to
-two conflicting targets).
+It really fits thin-plate splines to deterministic inputs (no network, no
+sleep, no pre-recorded output):
+
+  1. a normal non-affine deformation on a 4x4 grid (lam = 0), with analytic
+     Jacobian checked against live finite differences;
+  2. the confidence-weighted smoothing spline: four trusted identity corners
+     plus one gross outlier, compared at full / low / zero confidence and at
+     lam = 0 (where confidence is degenerate and every point is hit);
+  3. contract boundaries that actually fire: a conflicting duplicate source,
+     an invalid (negative) confidence weight, and a degenerate positive
+     subset (only collinear points are trusted with lam > 0).
 """
 
 import math
 import time
 
-from tps2d import fit, TPSInputError
+from tps2d import fit, TPSInputError, DegeneratePointsError
 
 
 def build_problem():
@@ -29,21 +36,18 @@ def build_problem():
     return sources, targets
 
 
-def main():
-    started = time.perf_counter()
-
+def section_grid():
     sources, targets = build_problem()
     result = fit(sources, targets, lam=0.0)
     warp = result.warp
 
-    print("=== tps2d demo: thin-plate spline on a deterministic 4x4 grid ===")
+    print("=== 1. normal fit: thin-plate spline on a deterministic 4x4 grid ===")
     print(f"control points: {len(sources)} (limit 40), lambda = 0.0")
     print(f"affine design rank: {result.rank}")
     print(f"max control-point residual: {max(result.residuals):.3e}")
     print(f"RMS residual: {result.rms_residual:.3e}")
     print(f"bending energy w^T K w (both coords): {result.bending_energy:.6f}")
 
-    # Warp interior/edge grid points that are NOT control points.
     probes = [[1.5, 1.5], [4.5, 4.5], [7.5, 1.5], [4.5, 7.5], [0.75, 6.0]]
     print("\nwarped probe points:")
     print(f"  {'source':>16} -> {'target':>22}   det(J)")
@@ -56,7 +60,6 @@ def main():
             f" -> ({q[0]:8.4f},{q[1]:8.4f})   {det_j: .5f}"
         )
 
-    # Analytic Jacobian vs central finite differences, computed live.
     p = probes[0]
     h = 1e-6
     jx_p = warp.evaluate([p[0] + h, p[1]])
@@ -73,18 +76,83 @@ def main():
     )
     print(f"\nmax |J_analytic - J_finite-diff| at {p}: {err:.3e}")
 
-    # ---- a boundary that actually fires -------------------------------
-    print("\n=== contract boundary: conflicting duplicate source ===")
+
+def section_confidence():
+    print("\n=== 2. confidence-weighted smoothing (lam = 0.1) ===")
+    # Four trusted corners map by identity; the centre claims y' = 2.0.
+    src = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]]
+    tgt = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 2.0]]
+    print("trusted corners (identity) + one outlier (0.5,0.5) -> (0.5,2.0)")
+    print(f"  {'confidence of outlier':>22}   {'y at centre':>11}  "
+          f"{'max corner resid':>17}")
+    for sigma in (1.0, 1e-3, 0.0):
+        res = fit(src, tgt, lam=0.1,
+                  confidence=[1.0, 1.0, 1.0, 1.0, sigma])
+        y_centre = res.warp.evaluate(src[4])[1]
+        corner_resid = max(res.residuals[:4])
+        tag = "  (zero: point dropped)" if sigma == 0.0 else ""
+        print(f"  {sigma:22g}   {y_centre:11.6f}  {corner_resid:17.2e}{tag}")
+
+    dropped = fit(src, tgt, lam=0.1,
+                  confidence=[1.0, 1.0, 1.0, 1.0, 0.0])
+    print(f"  dropped-point reported residual ||f(c)-v|| = "
+          f"{dropped.residuals[4]:.6f} (analytic: 1.5)")
+    print(f"  reported merged confidence vector: {dropped.confidence}")
+
+    # Boundary: at lam = 0 confidence is degenerate -- exact interpolation.
+    exact = fit(src, tgt, lam=0.0,
+                confidence=[0.0, 9.0, 0.0, 1e-6, 0.25])
+    print(f"\n  lam = 0 with arbitrary confidence: max residual = "
+          f"{max(exact.residuals):.3e} (exact interpolation, weights ignored)")
+
+    # Duplicate compatible observations accumulate their confidence.
+    dup_src = [[0, 0], [1, 0], [0, 1], [1, 0]]
+    dup_tgt = [[0, 0], [1, 0], [0, 1], [1, 0]]
+    dup_sig = [1.0, 0.4, 2.0, 0.6]
+    merged = fit(dup_src, dup_tgt, lam=0.5, confidence=dup_sig)
+    print(f"  duplicate (1,0) weights 0.4+0.6 merge -> confidence "
+          f"{merged.confidence}, merged_count = {merged.merged_count}")
+
+
+def section_errors():
+    print("\n=== 3. contract boundaries (errors actually raised) ===")
+
+    print("[a] conflicting duplicate source point:")
     bad_sources = [[0, 0], [3, 0], [0, 3], [3, 0]]
-    bad_targets = [[0, 0], [3, 1], [1, 3], [3, 2]]  # point (3,0) twice, different
+    bad_targets = [[0, 0], [3, 1], [1, 3], [3, 2]]
     try:
-        fit(bad_sources, bad_targets)
+        fit(bad_sources, bad_targets, confidence=[1, 1, 1, 0.1])
     except TPSInputError as exc:
-        print(f"TPSInputError raised as required: {exc}")
+        print(f"    TPSInputError: {exc}")
     else:
         raise SystemExit("ERROR: expected TPSInputError was not raised")
 
-    print(f"\nelapsed: {time.perf_counter() - started:.2f} s")
+    print("[b] negative confidence weight:")
+    try:
+        fit([[0, 0], [1, 0], [0, 1]], [[0, 0], [1, 0], [0, 1]],
+            confidence=[1.0, -0.2, 1.0])
+    except TPSInputError as exc:
+        print(f"    TPSInputError: {exc}")
+    else:
+        raise SystemExit("ERROR: expected TPSInputError was not raised")
+
+    print("[c] lam > 0 but only collinear points are trusted:")
+    src = [[0, 0], [1, 0], [2, 0], [0, 1], [1, 1]]
+    tgt = [[0, 0], [1, 0], [2, 0], [0, 1], [1, 1]]
+    try:
+        fit(src, tgt, lam=0.1, confidence=[1.0, 1.0, 1.0, 0.0, 0.0])
+    except DegeneratePointsError as exc:
+        print(f"    DegeneratePointsError: {exc}")
+    else:
+        raise SystemExit("ERROR: expected DegeneratePointsError was not raised")
+
+
+def main():
+    started = time.perf_counter()
+    section_grid()
+    section_confidence()
+    section_errors()
+    print(f"\nelapsed: {time.perf_counter() - started:.3f} s")
 
 
 if __name__ == "__main__":

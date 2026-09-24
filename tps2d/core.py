@@ -10,11 +10,22 @@ fitted independently for the two output coordinates by solving
     [ K + lambda*I   P ] [w]   [v]
     [ P^T            0 ] [a] = [0],   P_i = [1, x_i, y_i],
 
-which enforces P^T w = 0.  Inputs are validated strictly: NaN/Infinity are
-rejected, booleans are not accepted as numbers, duplicate source points with
-conflicting targets raise, and control-point configurations whose affine
-part is rank deficient (all collinear, or fewer than 3 distinct points after
-merging) raise `DegeneratePointsError`.
+which enforces P^T w = 0.  Per-control-point confidence weights sigma_i >= 0
+turn this into a weighted smoothing spline: the minimised functional is
+
+    sum_i sigma_i * ||f(c_i) - v_i||^2  +  lambda * w^T K w,
+
+whose joint (w, a) stationarity system has the same block form with the
+diagonal regulariser ``lambda / sigma_i`` (sigma = 1 everywhere reproduces
+the unweighted problem; at lambda = 0 the weights do not enter the system,
+so exact interpolation is unchanged).
+
+Inputs are validated strictly: NaN/Infinity are rejected, booleans are not
+accepted as numbers, duplicate source points with conflicting targets raise,
+and control-point configurations whose affine part is rank deficient (all
+collinear, fewer than 3 distinct points after merging, or -- with weights and
+lambda > 0 -- fewer than 3 non-collinear *positively weighted* points) raise
+`DegeneratePointsError`.
 """
 
 from __future__ import annotations
@@ -81,6 +92,31 @@ def _check_points(points, name):
     return cleaned
 
 
+def _check_confidence(confidence, n):
+    """Validate the optional per-point confidence vector.
+
+    ``None`` means unit weight everywhere.  Otherwise it must be a list/tuple
+    of exactly ``n`` finite, non-negative real numbers (booleans rejected).
+    """
+    if confidence is None:
+        return [1.0] * n
+    if not isinstance(confidence, (list, tuple)):
+        raise TPSInputError(
+            "confidence must be a list/tuple of non-negative weights or None"
+        )
+    if len(confidence) != n:
+        raise TPSInputError(
+            f"confidence length {len(confidence)} != number of point pairs {n}"
+        )
+    cleaned = []
+    for k, value in enumerate(confidence):
+        w = _finite_float(value, f"confidence[{k}]")
+        if w < 0.0:
+            raise TPSInputError(f"confidence[{k}] must be >= 0, got {w}")
+        cleaned.append(w)
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Kernel
 # ---------------------------------------------------------------------------
@@ -125,6 +161,10 @@ class TPSFitResult:
     merged_count:
         Number of distinct source points after same-target duplicates were
         merged (may be < the number of input pairs).
+    confidence:
+        Per-(merged)point confidence weights sigma actually used, length
+        ``merged_count``; identical duplicate source points accumulate their
+        weights.
     """
 
     warp: "TPSWarp"
@@ -135,6 +175,7 @@ class TPSFitResult:
     bending_energy: float
     rank: int
     merged_count: int
+    confidence: list
 
     @property
     def coefficients(self):
@@ -227,31 +268,36 @@ class TPSWarp:
 # Fitting
 # ---------------------------------------------------------------------------
 
-def _merge_duplicates(sources, targets):
+def _merge_duplicates(sources, targets, confidence):
     """Collapse repeated source points.
 
-    Same source + same target -> one control point.  Same source + different
-    targets -> TPSInputError (no unique interpolant).  Returns merged lists.
-    Coordinate equality is exact (already-converted floats); callers needing
-    tolerance-based merging must pre-snap their own data.
+    Same source + same target -> one control point (confidence weights add:
+    two independent observations of equal confidence carry twice the weight).
+    Same source + different targets -> TPSInputError (no unique interpolant).
+    Returns merged source, target and confidence lists.  Coordinate equality
+    is exact (already-converted floats); callers needing tolerance-based
+    merging must pre-snap their own data.
     """
     seen = {}
     order = []
-    for s, t in zip(sources, targets):
+    merged_conf = {}
+    for s, t, c in zip(sources, targets, confidence):
         if s in seen:
             if seen[s] != t:
                 raise TPSInputError(
                     f"duplicate source point {s} maps to conflicting targets "
                     f"{seen[s]} and {t}"
                 )
-            # identical pair: silently merge
+            # identical pair: merge and accumulate the observation weights
+            merged_conf[s] += c
             continue
         seen[s] = t
+        merged_conf[s] = c
         order.append(s)
-    return order, [seen[s] for s in order]
+    return order, [seen[s] for s in order], [merged_conf[s] for s in order]
 
 
-def fit(sources, targets, lam=0.0):
+def fit(sources, targets, lam=0.0, confidence=None):
     """Fit a 2-D thin-plate spline.
 
     Parameters
@@ -261,9 +307,20 @@ def fit(sources, targets, lam=0.0):
     targets:
         Corresponding points ``[[x', y'], ...]`` in the target frame.
     lam:
-        Regularisation parameter lambda >= 0 added as ``lambda * I`` to K.
+        Regularisation parameter lambda >= 0 on the bending term.
         ``lam = 0`` interpolates the (merged) control points exactly (up to
         floating-point round-off); larger values trade fit for smoothness.
+    confidence:
+        Optional per-point confidence weights ``sigma_i >= 0`` (same length
+        as ``sources``/``targets``; ``None`` means 1 everywhere).  The joint
+        objective is ``sum_i sigma_i ||f(c_i) - v_i||^2 + lambda * w^T K w``
+        with affine and bending parts solved together.  At ``lam = 0`` the
+        weights do not enter the system and every point is interpolated
+        exactly.  At ``lam > 0`` a point with ``sigma_i = 0`` is an untrusted
+        observation: its equation drops out (its kernel coefficient is zero)
+        and it only appears in the reported residuals; at least three
+        non-collinear positively-weighted points must remain.  Duplicate
+        source points with identical targets accumulate their weights.
 
     Returns
     -------
@@ -273,10 +330,11 @@ def fit(sources, targets, lam=0.0):
     ------
     TPSInputError
         Bad shapes/types, non-finite numbers, booleans-as-numbers,
-        conflicting duplicates, or invalid lambda.
+        conflicting duplicates, invalid lambda or invalid confidence.
     DegeneratePointsError
-        Fewer than 3 distinct source points or collinear configuration
-        (rank of P < 3).
+        Fewer than 3 distinct source points, collinear configuration, or --
+        with lambda > 0 -- fewer than 3 non-collinear positively-weighted
+        points.
     """
     src = _check_points(sources, "sources")
     tgt = _check_points(targets, "targets")
@@ -292,8 +350,9 @@ def fit(sources, targets, lam=0.0):
     lam_f = _finite_float(lam, "lam")
     if lam_f < 0.0:
         raise TPSInputError(f"lam must be >= 0, got {lam_f}")
+    conf = _check_confidence(confidence, len(src))
 
-    src, tgt = _merge_duplicates(src, tgt)
+    src, tgt, conf = _merge_duplicates(src, tgt, conf)
     n = len(src)
     if n < 3:
         raise DegeneratePointsError(
@@ -307,8 +366,9 @@ def fit(sources, targets, lam=0.0):
     # targets are divided by the same factor.  Using U(s*r) = s^2 U(r) and
     # sum(w)=0, the fitted coefficients are converted back exactly:
     #     w = w~ / s,  a1 = a~1, a2 = a~2,  a0 = s*a~0 - a~1*cx - a~2*cy,
-    # and the regulariser maps to  lam~ = lam / s^2.  Residuals and the
-    # bending energy (w^T K w, scale invariant) are reported in user units.
+    # and the regulariser maps to  lam~ = lam / s^2.  Confidence weights are
+    # dimensionless and unchanged.  Residuals and the bending energy
+    # (w^T K w, scale invariant) are reported in user units.
     cx = sum(p[0] for p in src) / n
     cy = sum(p[1] for p in src) / n
     diameter = 0.0
@@ -325,37 +385,59 @@ def fit(sources, targets, lam=0.0):
     ntgt = [[vx / diameter, vy / diameter] for (vx, vy) in tgt]
     nlam = lam_f / (diameter * diameter)
 
-    # Rank of the (normalised, scale-independent) affine design P = [1, x, y].
-    Pn = [[1.0, sx, sy] for (sx, sy) in nsrc]
+    # Select the equations that actually constrain the fit.  At lam = 0 every
+    # point is interpolated regardless of confidence.  At lam > 0 a zero
+    # confidence means "unobserved": the stationarity system forces w_i = 0,
+    # which is equivalent to deleting that point's row/column; we solve the
+    # smaller system and scatter zero coefficients back afterwards so weights
+    # stay aligned with the merged input order.
+    if nlam == 0.0:
+        active = list(range(n))
+    else:
+        active = [i for i, c in enumerate(conf) if c > 0.0]
+        if len(active) < 3:
+            raise DegeneratePointsError(
+                f"with lam > 0 need at least 3 positively weighted points, "
+                f"got {len(active)}"
+            )
+
+    # Rank of the (normalised, scale-independent) affine design P = [1, x, y]
+    # over the equations that actually constrain the affine part.
+    Pn = [[1.0, nsrc[i][0], nsrc[i][1]] for i in active]
     rank = affine_rank(Pn)
     if rank < 3:
         raise DegeneratePointsError(
-            f"affine design matrix rank is {rank} < 3: control points are "
-            f"collinear or fewer than 3 distinct points after merging"
+            f"affine design matrix rank is {rank} < 3: positively weighted "
+            f"control points are collinear (or fewer than 3 distinct after "
+            f"merging and zero-confidence removal)"
         )
 
-    # Assemble the (n+3) x (n+3) TPS system  [K+lam~ I  P; P^T 0].
-    size = n + 3
+    # Assemble the (m+3) x (m+3) joint system
+    # [K + diag(lam~/sigma_k)   P; P^T 0] [w; a] = [v; 0].
+    m = len(active)
+    size = m + 3
     A = [[0.0] * size for _ in range(size)]
-    for i in range(n):
+    for k, i in enumerate(active):
         xi, yi = nsrc[i]
-        for j in range(i + 1, n):
+        for l in range(k + 1, m):
+            j = active[l]
             xj, yj = nsrc[j]
             kij = _U(xi - xj, yi - yj)
-            A[i][j] = kij
-            A[j][i] = kij
-        A[i][i] = nlam
+            A[k][l] = kij
+            A[l][k] = kij
+        if nlam > 0.0:
+            A[k][k] = nlam / conf[i]
         # P block
-        A[i][n] = 1.0
-        A[i][n + 1] = xi
-        A[i][n + 2] = yi
+        A[k][m] = 1.0
+        A[k][m + 1] = xi
+        A[k][m + 2] = yi
         # P^T block
-        A[n][i] = 1.0
-        A[n + 1][i] = xi
-        A[n + 2][i] = yi
+        A[m][k] = 1.0
+        A[m + 1][k] = xi
+        A[m + 2][k] = yi
 
-    rhs_x = [t[0] for t in ntgt] + [0.0, 0.0, 0.0]
-    rhs_y = [t[1] for t in ntgt] + [0.0, 0.0, 0.0]
+    rhs_x = [ntgt[i][0] for i in active] + [0.0, 0.0, 0.0]
+    rhs_y = [ntgt[i][1] for i in active] + [0.0, 0.0, 0.0]
 
     try:
         sol_x, sol_y = solve_linear(A, [rhs_x, rhs_y])
@@ -373,13 +455,13 @@ def fit(sources, targets, lam=0.0):
     # s*ln(s) * sum(w~_i ||c~_i||^2), which is absorbed into a0.
     s = diameter
     ln_s = math.log(s)
-    wx_n, ax_n = sol_x[:n], sol_x[n:]
-    wy_n, ay_n = sol_y[:n], sol_y[n:]
+    wx_n, ax_n = sol_x[:m], sol_x[m:]
+    wy_n, ay_n = sol_y[:m], sol_y[m:]
 
-    def _back_to_user(w_n, a_n, cxu, cyu):
+    def _affine_back(w_n, a_n, cxu, cyu):
         const = ln_s * sum(
-            w_n[i] * (nsrc[i][0] * nsrc[i][0] + nsrc[i][1] * nsrc[i][1])
-            for i in range(n)
+            w_n[k] * (nsrc[active[k]][0] ** 2 + nsrc[active[k]][1] ** 2)
+            for k in range(m)
         )
         return [
             s * a_n[0] - a_n[1] * cxu - a_n[2] * cyu - s * const,
@@ -387,16 +469,22 @@ def fit(sources, targets, lam=0.0):
             a_n[2],
         ]
 
-    wx = [wi / s for wi in wx_n]
-    wy = [wi / s for wi in wy_n]
-    ax = _back_to_user(wx_n, ax_n, cx, cy)
-    ay = _back_to_user(wy_n, ay_n, cx, cy)
+    # Scatter into merged-order arrays of length n; inactive (zero-confidence
+    # at lam > 0) points get coefficient 0, which exactly enforces w_i = 0.
+    wx = [0.0] * n
+    wy = [0.0] * n
+    for k, i in enumerate(active):
+        wx[i] = wx_n[k] / s
+        wy[i] = wy_n[k] / s
+    ax = _affine_back(wx_n, ax_n, cx, cy)
+    ay = _affine_back(wy_n, ay_n, cx, cy)
     weights = [[wx[i], wy[i]] for i in range(n)]
     affine = [[ax[0], ay[0]], [ax[1], ay[1]], [ax[2], ay[2]]]
 
     warp = TPSWarp(control_points=src, weights=weights, affine=affine)
 
-    # Residuals at the (merged) control points, in original units.
+    # Residuals at all merged control points (including zero-confidence ones),
+    # in original units.
     residuals = []
     sq_sum = 0.0
     for i, pt in enumerate(src):
@@ -412,12 +500,12 @@ def fit(sources, targets, lam=0.0):
     energy = 0.0
     for w_coord in (wx_n, wy_n):
         acc = 0.0
-        for i in range(n):
-            xi, yi = nsrc[i]
-            for j in range(i + 1, n):
-                xj, yj = nsrc[j]
-                kij = _U(xi - xj, yi - yj)
-                acc += 2.0 * w_coord[i] * w_coord[j] * kij
+        for k in range(m):
+            xi, yi = nsrc[active[k]]
+            for l in range(k + 1, m):
+                xj, yj = nsrc[active[l]]
+                kj = _U(xi - xj, yi - yj)
+                acc += 2.0 * w_coord[k] * w_coord[l] * kj
         energy += acc
 
     return TPSFitResult(
@@ -429,4 +517,5 @@ def fit(sources, targets, lam=0.0):
         bending_energy=energy,
         rank=rank,
         merged_count=n,
+        confidence=list(conf),
     )
