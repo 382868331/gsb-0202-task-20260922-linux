@@ -83,6 +83,57 @@ def reference_warp(params, x, y):
     return ox, oy
 
 
+def reference_fit_weighted(src, tgt, sigmas, lam):
+    """Independent weighted smoothing fit.
+
+    Minimises  sum_i sigma_i (f(c_i) - v_i)^2 + lam * w^T K w  by solving,
+    in residual form (w_i = sigma_i r_i / lam),
+
+        [ I + K W / lam   P ] [r]   [v]
+        [ P^T W           0 ] [a] = [0],   W = diag(sigma_i).
+
+    Written from scratch for the tests: own assembly, own Gauss-Jordan
+    elimination, no import of the package under test.  Duplicate source
+    points with identical targets are expected to have been pre-merged by
+    the caller (sigmas add); this routine does no merging itself.
+    """
+    if lam <= 0.0:
+        raise ValueError("reference weighted fit needs lam > 0")
+    pts = [(float(s[0]), float(s[1])) for s in src]
+    tv = [(float(t[0]), float(t[1])) for t in tgt]
+    wgt = [float(z) for z in sigmas]
+    n = len(pts)
+    size = n + 3
+    m = [[0.0] * size for _ in range(size)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                m[i][i] = 1.0  # K_ii = U(0) = 0
+                continue
+            if wgt[j] == 0.0:
+                continue  # zero-confidence columns decouple
+            m[i][j] = (
+                kernel(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1])
+                * wgt[j]
+                / lam
+            )
+        m[i][n] = 1.0
+        m[i][n + 1] = pts[i][0]
+        m[i][n + 2] = pts[i][1]
+        m[n][i] = wgt[i]
+        m[n + 1][i] = wgt[i] * pts[i][0]
+        m[n + 2][i] = wgt[i] * pts[i][1]
+    bx = [v[0] for v in tv] + [0.0, 0.0, 0.0]
+    by = [v[1] for v in tv] + [0.0, 0.0, 0.0]
+    solx = gauss_solve(m, bx)
+    soly = gauss_solve(m, by)
+    rx, ry = solx[:n], soly[:n]
+    ax, ay = solx[n:], soly[n:]
+    wx = [wgt[i] * rx[i] / lam for i in range(n)]
+    wy = [wgt[i] * ry[i] / lam for i in range(n)]
+    return wx, wy, ax, ay, pts
+
+
 def finite_diff_jacobian(eval2d, x, y, h=1e-6):
     """Central-difference Jacobian of any callable (x, y) -> (ox, oy)."""
     xp = eval2d(x + h, y)
