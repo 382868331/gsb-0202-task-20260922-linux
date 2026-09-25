@@ -11,10 +11,10 @@
 - 网络 / 账号 / 密钥 / 数据库 / 中间件 / 云 API / Docker：均不需要
 
 ```bash
-# 必要测试（38 个用例）
+# 必要测试（52 个用例）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（约 0.03 秒，上限要求约 8 秒内）
+# 固定输入演示（约 0.05 秒，上限要求约 8 秒内）
 python demo.py
 ```
 
@@ -80,6 +80,42 @@ warp.jacobian([x, y])          # -> 2×2 [[dfx/dx, dfx/dy],[dfy/dx, dfy/dy]]
 Jacobian 由核函数解析导数给出：`∂U/∂x = dx·(ln r² + 1)`，在控制点处（r=0）
 方向导数取 0，结果有限。
 
+## 留一诊断（leave-one-out）
+
+用于排查个别异常控制点：对每个**合并后**的控制点，整组移除后用相同 `lam`
+重新拟合，报告该点位置的预测与残差。
+
+```python
+from tps2d import leave_one_out
+
+loo = leave_one_out(sources, targets, lam=0.0)
+for e in loo.entries:            # 每个合并后控制点一条 LeaveOneOutEntry
+    if e.computable:
+        print(e.point, e.prediction, e.residual)
+    else:
+        print(e.point, "not computable:", e.reason)
+loo.max_residual_entry           # 残差最大的可计算条目（无则 None）
+loo.fit                          # 完整数据的基础 TPSFitResult
+```
+
+`LeaveOneOutEntry` 字段：`index`（合并后控制点下标）、`point`、`target`、
+`prediction`（`[x', y']` 或 `None`）、`residual`（欧氏范数或 `None`）、
+`computable`、`reason`。
+
+行为契约：
+
+- **重复点按组移除**：同位置同目标的重复输入先合并为一个控制点，留一时
+  整组删除，不会只删一条而让另一条把目标泄漏进预测；
+- 每个条目与“真正删除该组后调用 `fit`（相同 lambda）”**逐点等价**——
+  缩减问题走与独立 `fit` 完全相同的代码路径（含内部重新归一化）；
+- 移除后仿射秩不足（如三点删一剩两点、剩余点共线）或系统奇异时，该条目
+  `computable=False`，`prediction`/`residual` 为 `None`，**绝不输出 0 残差**；
+- `lam=0` 与 `lam>0` 均支持；诊断不修改基础 fit 对象，其 warp 行为前后一致；
+- 输入校验与 `fit` 完全相同（冲突重复点、NaN、退化构型等照常抛出）。
+
+**注意**：留一残差大只说明该点在此模型下与邻点不一致，是一个数值诊断，
+不能直接解释为真实测量质量保证。
+
 ## 错误语义（非法输入不静默纠正）
 
 所有错误抛出 `TPSInputError`（`ValueError` 子类），信息携带可定位的下标/字段名；
@@ -113,6 +149,8 @@ IEEE-754 binary64（双精度），部分主元高斯消元。测试断言口径
   像素尺度（~1e3）实测 Jacobian 最大偏差约 1e-9，差分步长与坐标量级匹配）；
 - 共线判定阈值：离轴偏差小于构型直径 **1e-12** 倍即视为退化（约 4.5×10³ 倍
   机器精度，刻意收紧）；消元主元阈值为 `(n+3)·eps·max|A_ij|`。
+- 留一诊断：与独立参考逐组重建的小系统比较，两个输出坐标的预测
+  **绝对误差 < 1e-9**（O(1) 坐标，lam=0 与 lam>0 均验证）。
 
 阈值的含义明确：1e-12 直径以内的近共线构型会被当作退化拒绝，而不是带着
 近奇异矩阵硬解。
@@ -141,6 +179,8 @@ IEEE-754 binary64（双精度），部分主元高斯消元。测试断言口径
 - 重复点按精确浮点相等判定，不做近邻吸附/容差合并（需要时由调用方预先归并）；
 - 弯曲能为代数口径 `wᵀKw`，未乘经典文献的归一化常数；
 - 近退化构型（离轴 < 1e-12 直径）一律报退化，不尝试奇异值截断求解；
+- 留一诊断按组重解缩减系统（n ≤ 40 时为毫秒级），未做分解复用优化；
+- 留一残差是数值诊断指标，不构成测量质量保证；
 - 不声明与任何行业配准标准的完整兼容性，只实现本契约的数学子集。
 
 ## 目录
@@ -149,7 +189,8 @@ IEEE-754 binary64（双精度），部分主元高斯消元。测试断言口径
 tps2d/__init__.py     # 公开接口
 tps2d/core.py         # 校验、核函数、fit/warp/Jacobian/残差/弯曲能
 tps2d/_linalg.py      # 部分主元高斯消元 + 仿射秩
-tests/test_tps.py     # 38 个必要测试
+tests/test_tps.py     # 38 个拟合回归测试
+tests/test_leave_one_out.py  # 14 个留一诊断测试
 tests/_reference.py   # 仅供测试的独立参考实现
 demo.py               # 固定输入演示（正常结果 + 实际触发的拒绝）
 ```

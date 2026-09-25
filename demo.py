@@ -11,7 +11,7 @@ two conflicting targets).
 import math
 import time
 
-from tps2d import fit, TPSInputError
+from tps2d import fit, leave_one_out, TPSInputError
 
 
 def build_problem():
@@ -72,6 +72,28 @@ def main():
         abs(j_ana[r][c] - j_num[r][c]) for r in range(2) for c in range(2)
     )
     print(f"\nmax |J_analytic - J_finite-diff| at {p}: {err:.3e}")
+
+    # ---- leave-one-out control-point diagnostic -------------------------
+    print("\n=== leave-one-out diagnostic (same lambda, group = merged point) ===")
+    loo = leave_one_out(sources, targets, lam=0.0)
+    print(f"groups diagnosed: {len(loo.entries)} "
+          f"(computable: {len(loo.computable_entries)})")
+    top = loo.max_residual_entry
+    print(f"largest LOO residual: {top.residual:.3e} at {top.point} "
+          f"-> predicted ({top.prediction[0]:.4f},{top.prediction[1]:.4f})")
+    # Add one deviating duplicate pair (same source, same target -> merged)
+    # and show the diagnostic flags the whole group without target leakage.
+    odd_sources = sources + [[4.5, 4.5], [4.5, 4.5]]
+    odd_targets = targets + [[9.0, 0.0], [9.0, 0.0]]
+    loo_odd = leave_one_out(odd_sources, odd_targets, lam=0.0)
+    top_odd = loo_odd.max_residual_entry
+    print(f"with injected outlier pair (merged to one group): "
+          f"LOO residual {top_odd.residual:.3f} at {top_odd.point}")
+    # Three-point set: removing any point leaves < 3 points -> not computable.
+    tiny = leave_one_out([[0, 0], [1, 0], [0, 1]], [[1, 2], [2, 2], [1, 3]])
+    print("3-point set: all groups computable =",
+          all(e.computable for e in tiny.entries),
+          "(residuals reported as None, never 0)")
 
     # ---- a boundary that actually fires -------------------------------
     print("\n=== contract boundary: conflicting duplicate source ===")

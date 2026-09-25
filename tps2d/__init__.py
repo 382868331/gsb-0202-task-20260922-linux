@@ -6,7 +6,10 @@ from .core import (
     DegeneratePointsError,
     TPSFitResult,
     TPSWarp,
+    LeaveOneOutEntry,
+    LeaveOneOutResult,
     fit,
+    leave_one_out,
 )
 
 __all__ = [
@@ -15,5 +18,8 @@ __all__ = [
     "DegeneratePointsError",
     "TPSFitResult",
     "TPSWarp",
+    "LeaveOneOutEntry",
+    "LeaveOneOutResult",
     "fit",
+    "leave_one_out",
 ]

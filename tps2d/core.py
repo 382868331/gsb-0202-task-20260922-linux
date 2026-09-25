@@ -30,7 +30,10 @@ __all__ = [
     "DegeneratePointsError",
     "TPSFitResult",
     "TPSWarp",
+    "LeaveOneOutEntry",
+    "LeaveOneOutResult",
     "fit",
+    "leave_one_out",
 ]
 
 MAX_CONTROL_POINTS = 40
@@ -140,6 +143,68 @@ class TPSFitResult:
     def coefficients(self):
         """Tuple ``(weights, affine)`` exactly as stored."""
         return self.weights, self.affine
+
+
+@dataclass
+class LeaveOneOutEntry:
+    """Leave-one-out diagnostic for one merged control point.
+
+    Attributes
+    ----------
+    index:
+        Index into the merged control-point list of the base fit
+        (result.warp.control_points[index]).
+    point / target:
+        The removed source point and its target, in caller units.
+    prediction:
+        [x', y'] predicted at point by the same-lambda fit computed
+        without this group, or None when the reduced problem is not
+        computable (affine rank < 3 or numerically singular system).
+    residual:
+        Euclidean norm ||prediction - target||, or None when the
+        group is not computable.  Never silently reported as 0.
+    computable / reason:
+        Whether the reduced fit succeeded; if not, why.
+    """
+
+    index: int
+    point: list
+    target: list
+    prediction: list | None
+    residual: float | None
+    computable: bool
+    reason: str | None
+
+
+@dataclass
+class LeaveOneOutResult:
+    """Outcome of leave_one_out.
+
+    Attributes
+    ----------
+    fit:
+        The base TPSFitResult on the full (merged) control-point set.
+        The diagnostic never mutates it; its warp keeps working unchanged.
+    entries:
+        One LeaveOneOutEntry per merged control point, in the same order
+        as fit.warp.control_points.
+    """
+
+    fit: "TPSFitResult"
+    entries: list
+
+    @property
+    def computable_entries(self):
+        """Only the entries whose reduced fit could be computed."""
+        return [e for e in self.entries if e.computable]
+
+    @property
+    def max_residual_entry(self):
+        """Computable entry with the largest leave-one-out residual (or None)."""
+        computable = self.computable_entries
+        if not computable:
+            return None
+        return max(computable, key=lambda e: e.residual)
 
 
 @dataclass
@@ -430,3 +495,85 @@ def fit(sources, targets, lam=0.0):
         rank=rank,
         merged_count=n,
     )
+
+
+# ---------------------------------------------------------------------------
+# Leave-one-out diagnostics
+# ---------------------------------------------------------------------------
+
+def leave_one_out(sources, targets, lam=0.0):
+    """Leave-one-out diagnostic over the merged control points.
+
+    Fits the full data exactly as `fit` does (same validation, same
+    same-target duplicate merging), then, for every *merged* control point,
+    removes that whole group and re-fits the remaining points with the same
+    `lam`.  The prediction of each reduced fit at the removed point and its
+    residual against the removed target are reported per group.
+
+    Duplicate source points sharing one target form a single group: the
+    whole group is removed together, so a duplicated point can never leak
+    its own target into its leave-one-out prediction.
+
+    Each reduced fit is computed by the same code path as an independent
+    `fit` call on the reduced set (including its internal renormalisation),
+    so every entry is exactly equivalent to deleting that group and calling
+    `fit` with the same lambda.  If the reduced configuration is degenerate
+    (fewer than 3 distinct points, collinear, or a numerically singular
+    system), the entry is marked ``computable=False`` with ``prediction``
+    and ``residual`` set to None -- never to 0.
+
+    The base fit object is not modified and its warp behaves identically
+    before and after this call.  Works for both ``lam=0`` and ``lam>0``.
+
+    Note: a large leave-one-out residual flags a control point that is
+    inconsistent with its neighbours under this model; it is a numerical
+    diagnostic, not a measurement-quality guarantee.
+
+    Returns
+    -------
+    LeaveOneOutResult
+
+    Raises
+    ------
+    TPSInputError / DegeneratePointsError
+        Same contract as `fit` for the full data set.
+    """
+    base = fit(sources, targets, lam=lam)
+
+    # Re-derive the merged target list (fit already validated the inputs).
+    src = _check_points(sources, "sources")
+    tgt = _check_points(targets, "targets")
+    merged_src, merged_tgt = _merge_duplicates(src, tgt)
+
+    entries = []
+    for i, (point, target) in enumerate(zip(merged_src, merged_tgt)):
+        red_src = [list(p) for k, p in enumerate(merged_src) if k != i]
+        red_tgt = [list(t) for k, t in enumerate(merged_tgt) if k != i]
+        try:
+            reduced = fit(red_src, red_tgt, lam=lam)
+        except DegeneratePointsError as exc:
+            entries.append(LeaveOneOutEntry(
+                index=i,
+                point=[point[0], point[1]],
+                target=[target[0], target[1]],
+                prediction=None,
+                residual=None,
+                computable=False,
+                reason=str(exc),
+            ))
+            continue
+        prediction = reduced.warp.evaluate(point)
+        residual = math.hypot(
+            prediction[0] - target[0], prediction[1] - target[1]
+        )
+        entries.append(LeaveOneOutEntry(
+            index=i,
+            point=[point[0], point[1]],
+            target=[target[0], target[1]],
+            prediction=prediction,
+            residual=residual,
+            computable=True,
+            reason=None,
+        ))
+
+    return LeaveOneOutResult(fit=base, entries=entries)
