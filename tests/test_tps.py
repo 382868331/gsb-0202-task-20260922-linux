@@ -15,7 +15,13 @@ import math
 import unittest
 
 import tps2d
-from tps2d import fit, TPSInputError, DegeneratePointsError, MAX_CONTROL_POINTS
+from tps2d import (
+    fit,
+    leave_one_out,
+    TPSInputError,
+    DegeneratePointsError,
+    MAX_CONTROL_POINTS,
+)
 
 from _reference import reference_fit, reference_warp, finite_diff_jacobian, kernel
 
@@ -368,6 +374,177 @@ class KernelConventionTests(unittest.TestCase):
         self.assertTrue(all(math.isfinite(v) for v in out))
         self.assertAlmostEqual(out[0], 0.5, delta=1e-9)
         self.assertAlmostEqual(out[1], -0.5, delta=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Leave-one-group-out influence diagnostics
+# ---------------------------------------------------------------------------
+
+# Tolerance for leave-one-out outputs against an independent per-group
+# rebuild: each LOO prediction must match, up to round-off, a genuine refit
+# on the reduced point set with the same lambda.
+LOO_TOL = 1e-9
+
+
+def assert_loo_matches_reference(testcase, src, tgt, lam=0.0):
+    """Compare package LOO outputs against independent per-group rebuilds."""
+    result = fit(src, tgt, lam=lam)
+    diagnostics = result.leave_one_out()
+    merged = result.warp.control_points
+    n = len(merged)
+    failed = []
+    for g, entry in enumerate(diagnostics):
+        kept = [i for i in range(n) if i != g]
+        kept_src = [merged[i] for i in kept]
+        kept_tgt = [result.merged_targets[i] for i in kept]
+        try:
+            params = reference_fit(kept_src, kept_tgt, lam=lam)
+        except ZeroDivisionError:
+            if entry.computable:
+                failed.append((g, "package computed, reference singular"))
+            continue
+        if not entry.computable:
+            failed.append((g, "package flagged uncomputable, reference solved"))
+            continue
+        rx, ry = reference_warp(params, merged[g][0], merged[g][1])
+        tx, ty = result.merged_targets[g]
+        if abs(entry.predicted[0] - rx) > LOO_TOL:
+            failed.append((g, "x mismatch"))
+        if abs(entry.predicted[1] - ry) > LOO_TOL:
+            failed.append((g, "y mismatch"))
+        ex = entry.predicted[0] - tx
+        ey = entry.predicted[1] - ty
+        if abs(entry.residual_components[0] - ex) > 1e-12:
+            failed.append((g, "residual component x inconsistent"))
+        if abs(entry.residual_components[1] - ey) > 1e-12:
+            failed.append((g, "residual component y inconsistent"))
+        if abs(entry.residual - math.hypot(ex, ey)) > 1e-12:
+            failed.append((g, "residual norm inconsistent"))
+    testcase.assertFalse(
+        failed,
+        "LOO vs independent rebuild failures (tol=%s): %s" % (LOO_TOL, failed),
+    )
+    return diagnostics
+
+
+class LeaveOneOutTests(unittest.TestCase):
+    def test_pure_affine_loo_predicts_exactly(self):
+        src = [[0, 0], [1, 0], [0, 1], [2, 3], [-2, 1.5], [3.5, -2]]
+        tgt = [
+            [2.0 + 3.0 * x - 1.0 * y, -1.0 + 0.5 * x + 2.0 * y]
+            for x, y in src
+        ]
+        diagnostics = assert_loo_matches_reference(self, src, tgt, lam=0.0)
+        for entry in diagnostics:
+            self.assertTrue(entry.computable)
+            self.assertLess(entry.residual, 1e-9, entry)
+
+    def test_single_deviating_point_stands_out(self):
+        # All points follow the exact identity (affine) map except one.
+        src = [[0.0, 0.0], [4.0, 0.0], [0.0, 4.0],
+               [4.0, 4.0], [2.0, 1.5], [1.0, 3.0]]
+        tgt = [[x, y] for x, y in src]
+        tgt[4] = [2.0, 4.0]  # pull the interior point off the identity
+        diagnostics = assert_loo_matches_reference(self, src, tgt)
+        deviant = diagnostics[4]
+        self.assertTrue(deviant.computable)
+        # When the deviant group itself is withheld, nothing can reproduce
+        # its pulled target: its LOO residual is large (the same data with
+        # the target restored interpolate exactly, residual 0).
+        self.assertGreater(deviant.residual, 1.0)
+
+    def test_duplicate_same_target_is_one_group_no_leak(self):
+        # Point (1, 0) appears twice with the same target; both rows must be
+        # removed together or the twin row would leak the held-out target.
+        src = [[0, 0], [1, 0], [0, 1], [2, 2], [1, 0]]
+        tgt = [[0, 0], [1.2, 0.3], [0, 1], [2, 2], [1.2, 0.3]]
+        result = fit(src, tgt)
+        self.assertEqual(result.merged_count, 4)
+        group_idx = next(
+            k for k, p in enumerate(result.warp.control_points)
+            if p == (1.0, 0.0)
+        )
+        self.assertEqual(result.group_indices[group_idx], [1, 4])
+        diagnostics = assert_loo_matches_reference(self, src, tgt)
+        entry = diagnostics[group_idx]
+        self.assertEqual(entry.member_indices, [1, 4])
+        self.assertTrue(entry.computable)
+        # A leaky single-row deletion would give an exactly zero residual.
+        self.assertGreater(entry.residual, 1e-9)
+
+    def test_three_points_delete_one_is_degenerate(self):
+        src = [[0, 0], [1, 0], [0, 1]]
+        tgt = [[0, 0], [1, 0], [0, 1]]
+        diagnostics = leave_one_out(fit(src, tgt))
+        self.assertEqual(len(diagnostics), 3)
+        for entry in diagnostics:
+            self.assertFalse(entry.computable)
+            self.assertIsNone(entry.predicted)
+            self.assertIsNone(entry.residual)
+            self.assertIsNone(entry.residual_components)
+            self.assertIn("degenerate", entry.reason)
+
+    def test_collinear_after_removal_flagged(self):
+        # Removing the off-line point leaves three collinear points.
+        src = [[0, 0], [1, 0], [2, 0], [1, 1]]
+        tgt = [[0, 0], [1, 0], [2, 0], [1, 1]]
+        diagnostics = leave_one_out(fit(src, tgt))
+        offline = next(
+            i for i, d in enumerate(diagnostics) if d.source == [1.0, 1.0]
+        )
+        self.assertFalse(diagnostics[offline].computable)
+        for i, entry in enumerate(diagnostics):
+            if i != offline:
+                self.assertTrue(entry.computable, entry.reason)
+
+    def test_positive_lambda_matches_reference(self):
+        src = [[0, 0], [1, 0], [0, 1], [2, 3], [-2, 1.5], [3.5, -2]]
+        tgt = [
+            [x + 0.4 * math.sin(0.6 * x + 0.4 * y),
+             y + 0.3 * math.cos(0.5 * y - 0.3 * x)]
+            for x, y in src
+        ]
+        assert_loo_matches_reference(self, src, tgt, lam=5.0)
+
+    def test_zero_lambda_matches_reference_on_grid(self):
+        src = grid_points(4, 4)
+        tgt = [
+            [x + 0.4 * math.sin(0.5 * y), y + 0.3 * math.cos(0.4 * x)]
+            for x, y in src
+        ]
+        assert_loo_matches_reference(self, src, tgt, lam=0.0)
+
+    def test_diagnostic_does_not_mutate_fit_or_warp(self):
+        src = [[0, 0], [1, 0], [0, 1], [2, 2]]
+        tgt = [[0, 0], [1.2, 0.1], [0.1, 1], [2.1, 1.9]]
+        result = fit(src, tgt, lam=1.5)
+        before_w = [list(row) for row in result.weights]
+        before_a = [list(row) for row in result.affine]
+        before_eval = result.warp.evaluate([1.0, 1.0])
+        result.leave_one_out()
+        leave_one_out(result)
+        self.assertEqual(result.weights, before_w)
+        self.assertEqual(result.affine, before_a)
+        self.assertEqual(result.warp.evaluate([1.0, 1.0]), before_eval)
+
+    def test_entry_fields_consistent(self):
+        src = [[0, 0], [1, 0], [0, 1], [2, 2]]
+        tgt = [[0, 0], [1.0, 0.0], [0.0, 1.0], [2.0, 2.0]]
+        diagnostics = leave_one_out(fit(src, tgt))
+        for g, entry in enumerate(diagnostics):
+            self.assertEqual(entry.index, g)
+            self.assertEqual(entry.source, list(src[g]))
+            self.assertEqual(entry.target, list(tgt[g]))
+            self.assertEqual(entry.member_indices, [g])
+            if entry.computable:
+                ex = entry.predicted[0] - entry.target[0]
+                ey = entry.predicted[1] - entry.target[1]
+                self.assertAlmostEqual(entry.residual, math.hypot(ex, ey),
+                                       delta=1e-12)
+
+    def test_rejects_non_fit_argument(self):
+        with self.assertRaises(TPSInputError):
+            leave_one_out([[0, 0], [1, 0]])
 
 
 if __name__ == "__main__":

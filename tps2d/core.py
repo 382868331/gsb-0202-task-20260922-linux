@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 from ._linalg import solve_linear, affine_rank, SingularMatrixError
 
@@ -30,7 +31,9 @@ __all__ = [
     "DegeneratePointsError",
     "TPSFitResult",
     "TPSWarp",
+    "LOOResultPoint",
     "fit",
+    "leave_one_out",
 ]
 
 MAX_CONTROL_POINTS = 40
@@ -125,6 +128,15 @@ class TPSFitResult:
     merged_count:
         Number of distinct source points after same-target duplicates were
         merged (may be < the number of input pairs).
+    group_indices:
+        For each merged control point, the list of original input indices
+        collapsed into that group (identical source and identical target).
+        Leave-one-out diagnostics remove whole groups at once.
+    lam:
+        Regularisation parameter used for this fit; reused by the
+        leave-one-out refits.
+    merged_targets:
+        Target point for each merged control point.
     """
 
     warp: "TPSWarp"
@@ -135,11 +147,61 @@ class TPSFitResult:
     bending_energy: float
     rank: int
     merged_count: int
+    group_indices: list
+    lam: float
+    merged_targets: list
 
     @property
     def coefficients(self):
         """Tuple ``(weights, affine)`` exactly as stored."""
         return self.weights, self.affine
+
+    def leave_one_out(self):
+        """Compute the leave-one-group-out diagnostic; see leave_one_out."""
+        return leave_one_out(self)
+
+
+@dataclass
+class LOOResultPoint:
+    """Leave-one-group-out prediction for one merged control point.
+
+    This is a numerical influence/leverage diagnostic only; it is not a
+    guarantee of real-world measurement quality.
+
+    Attributes
+    ----------
+    index:
+        Index of the group in the merged control-point ordering
+        (result.warp.control_points and result.merged_targets).
+    member_indices:
+        Original input-row indices collapsed into this group.
+    source, target:
+        The merged unique source position and its target.
+    predicted:
+        [x, y] predicted at source by a fresh TPS refit with the same lam
+        after the WHOLE group (all coincident rows) was removed.  None when
+        the reduced problem is not computable.
+    residual_components:
+        [predicted_x - target_x, predicted_y - target_y], or None.
+    residual:
+        Euclidean norm of residual_components, or None.
+    computable:
+        False when removal leaves fewer than 3 distinct points, an
+        affine-rank-deficient (collinear) configuration, or a singular
+        reduced system.  No fabricated zero residual is emitted then.
+    reason:
+        Explanation when computable is False.
+    """
+
+    index: int
+    member_indices: list
+    source: list
+    target: list
+    predicted: Optional[list]
+    residual_components: Optional[list]
+    residual: Optional[float]
+    computable: bool
+    reason: Optional[str]
 
 
 @dataclass
@@ -231,7 +293,9 @@ def _merge_duplicates(sources, targets):
     """Collapse repeated source points.
 
     Same source + same target -> one control point.  Same source + different
-    targets -> TPSInputError (no unique interpolant).  Returns merged lists.
+    targets -> TPSInputError (no unique interpolant).  Returns the merged
+    source/target lists plus, for each merged point, the list of original
+    input-row indices that were collapsed into it.
     Coordinate equality is exact (already-converted floats); callers needing
     tolerance-based merging must pre-snap their own data.
     """
@@ -244,11 +308,16 @@ def _merge_duplicates(sources, targets):
                     f"duplicate source point {s} maps to conflicting targets "
                     f"{seen[s]} and {t}"
                 )
-            # identical pair: silently merge
+            # identical pair: silently merge (members collected below)
             continue
         seen[s] = t
         order.append(s)
-    return order, [seen[s] for s in order]
+    # Collect the original input-row indices of every merged group.
+    group_of = {s: k for k, s in enumerate(order)}
+    members = [[] for _ in order]
+    for row, s in enumerate(sources):
+        members[group_of[s]].append(row)
+    return order, [seen[s] for s in order], members
 
 
 def fit(sources, targets, lam=0.0):
@@ -293,7 +362,7 @@ def fit(sources, targets, lam=0.0):
     if lam_f < 0.0:
         raise TPSInputError(f"lam must be >= 0, got {lam_f}")
 
-    src, tgt = _merge_duplicates(src, tgt)
+    src, tgt, group_indices = _merge_duplicates(src, tgt)
     n = len(src)
     if n < 3:
         raise DegeneratePointsError(
@@ -429,4 +498,82 @@ def fit(sources, targets, lam=0.0):
         bending_energy=energy,
         rank=rank,
         merged_count=n,
+        group_indices=group_indices,
+        lam=lam_f,
+        merged_targets=tgt,
     )
+
+
+# ---------------------------------------------------------------------------
+# Leave-one-group-out influence diagnostic
+# ---------------------------------------------------------------------------
+
+def leave_one_out(result):
+    """Leave-one-group-out predictions for a fitted TPS.
+
+    For every merged control-point group g the spline is refitted from
+    scratch on the remaining groups with the SAME regularisation parameter
+    (result.lam) and evaluated at the removed group's source position.
+    Because duplicate input rows were merged into one group, the removed
+    point's target cannot leak back in through a coincident twin row.
+
+    The refit goes through the public fit entry point (identical matrix
+    assembly and normalisation), so every output is exactly what a genuine
+    deletion refit with the same lambda produces.  The diagnostic never
+    mutates result: the original coefficients, warp and all later
+    evaluations stay unchanged.
+
+    Both lam = 0 and lam > 0 are supported.  If deleting a group leaves
+    fewer than 3 distinct points, an affine-rank-deficient (collinear)
+    configuration, or a numerically singular reduced system, that group's
+    entry is flagged computable=False with a reason; no zero residual is
+    fabricated.
+
+    Returns a list of LOOResultPoint in the merged-group ordering.  This is
+    a numerical influence diagnostic, not an assurance of real measurement
+    quality.
+    """
+    if not isinstance(result, TPSFitResult):
+        raise TPSInputError(
+            "leave_one_out expects a TPSFitResult returned by fit(...)"
+        )
+
+    sources = result.warp.control_points
+    targets = result.merged_targets
+    lam = result.lam
+    n = len(sources)
+
+    diagnostics = []
+    for g in range(n):
+        remaining_src = [sources[i] for i in range(n) if i != g]
+        remaining_tgt = [targets[i] for i in range(n) if i != g]
+        entry_kwargs = {
+            "index": g,
+            "member_indices": list(result.group_indices[g]),
+            "source": list(sources[g]),
+            "target": list(targets[g]),
+        }
+        try:
+            reduced = fit(remaining_src, remaining_tgt, lam=lam)
+        except DegeneratePointsError as exc:
+            diagnostics.append(LOOResultPoint(
+                predicted=None,
+                residual_components=None,
+                residual=None,
+                computable=False,
+                reason=f"reduced configuration degenerate: {exc}",
+                **entry_kwargs,
+            ))
+            continue
+        px, py = reduced.warp.evaluate(sources[g])
+        tx, ty = targets[g]
+        ex, ey = px - tx, py - ty
+        diagnostics.append(LOOResultPoint(
+            predicted=[px, py],
+            residual_components=[ex, ey],
+            residual=math.hypot(ex, ey),
+            computable=True,
+            reason=None,
+            **entry_kwargs,
+        ))
+    return diagnostics

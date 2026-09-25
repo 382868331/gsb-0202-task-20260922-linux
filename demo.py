@@ -11,7 +11,7 @@ two conflicting targets).
 import math
 import time
 
-from tps2d import fit, TPSInputError
+from tps2d import fit, leave_one_out, TPSInputError
 
 
 def build_problem():
@@ -84,7 +84,56 @@ def main():
     else:
         raise SystemExit("ERROR: expected TPSInputError was not raised")
 
-    print(f"\nelapsed: {time.perf_counter() - started:.2f} s")
+    # ---- leave-one-group-out influence diagnostic ----------------------
+    print("\n=== leave-one-group-out diagnostic ===")
+    loo_src = [
+        [0, 0], [4, 0], [0, 4], [4, 4], [2, 2], [1, 3],
+        [2, 2],  # duplicate source AND duplicate target -> one group
+    ]
+    loo_tgt = [
+        [0, 0], [4, 0], [0, 4], [4, 4], [2.0, 3.4], [1, 3],
+        [2.0, 3.4],
+    ]
+    loo_result = fit(loo_src, loo_tgt)
+    deviant_group = next(
+        k for k, p in enumerate(loo_result.warp.control_points)
+        if p == (2.0, 2.0)
+    )
+    print(
+        f"{len(loo_src)} input rows -> {loo_result.merged_count} groups; "
+        f"group at (2,2) merges rows "
+        f"{loo_result.group_indices[deviant_group]}"
+    )
+    for entry in leave_one_out(loo_result):
+        if entry.computable:
+            print(
+                f"  group {entry.index} {tuple(entry.source)} "
+                f"members={entry.member_indices}: "
+                f"predicted=({entry.predicted[0]:.3f},"
+                f"{entry.predicted[1]:.3f}) residual={entry.residual:.3f}"
+            )
+        else:
+            print(
+                f"  group {entry.index} {tuple(entry.source)} "
+                f"members={entry.member_indices}: not computable "
+                f"({entry.reason.split(':')[0]})"
+            )
+    print(
+        "  (numerical influence diagnostic only; not a measurement-quality "
+        "guarantee)"
+    )
+
+    # Three control points: deleting any one leaves fewer than 3 distinct
+    # points, so every LOO entry must be flagged rather than zero-filled.
+    tiny = fit([[0, 0], [1, 0], [0, 1]], [[0, 0], [1, 0], [0, 1]])
+    tiny_entries = leave_one_out(tiny)
+    print(
+        "3-point configuration: "
+        f"{sum(not e.computable for e in tiny_entries)}/3 groups "
+        "flagged not-computable (no fabricated zero residual)"
+    )
+
+    print(f"\ntotal elapsed: {time.perf_counter() - started:.2f} s")
 
 
 if __name__ == "__main__":
