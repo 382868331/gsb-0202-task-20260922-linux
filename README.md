@@ -11,14 +11,28 @@
 - 网络 / 账号 / 密钥 / 数据库 / 中间件 / 云 API / Docker：均不需要
 
 ```bash
-# 必要测试（38 个用例）
+# 必要测试（53 个用例：38 基线 + 15 协方差传播）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（约 0.03 秒，上限要求约 8 秒内）
 python demo.py
+
+# 目标协方差传播演示（真实离线计算，实测约 0.01 秒，上限 90 秒）
+python demo_iteration.py
 ```
 
-两条命令都在仓库根目录执行，全程离线、无 `sleep`、无预录结果。
+命令都在仓库根目录执行，全程离线、无 `sleep`、无预录结果。
+
+### 隔离 venv 准备（可选但推荐）
+
+模块只用标准库，venv 仅用于隔离解释器环境，不需要联网安装任何依赖：
+
+```bash
+python3 -m venv .venv        # 一次性；Python 3.14.7
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python demo.py
+.venv/bin/python demo_iteration.py
+```
 
 ## 数学定义
 
@@ -79,6 +93,34 @@ warp.jacobian([x, y])          # -> 2×2 [[dfx/dx, dfx/dy],[dfy/dx, dfy/dy]]
 
 Jacobian 由核函数解析导数给出：`∂U/∂x = dx·(ln r² + 1)`，在控制点处（r=0）
 方向导数取 0，结果有限。
+
+## 目标协方差传播（固定设计下的线性不确定性）
+
+在**源控制点位置固定**（拟合系统为固定设计）的前提下，调用方可给出目标
+坐标的协方差，查询任意位置的预测协方差：
+
+```python
+result = fit(sources, targets)
+pred = result.predict_with_covariance(query_points, target_cov)
+```
+
+- `target_cov`：合并后目标的 **2n×2n** 对称半正定协方差，坐标按
+  `[x1, y1, x2, y2, …, xn, yn]` 堆叠；**允许控制点之间的相关误差**
+  （非对角块完整参与传播，不是只把对角方差相加）；允许零特征方向
+  （半正定，含全零矩阵）。
+- 返回 `TPSPrediction`：`means`（与 `warp.evaluate` 一致）、
+  `covariances`（每个查询点 2×2）、`influence`（每个查询点 2×n 影响权重，
+  `influence[q][0][i]` 乘控制点 i 的目标 x，`[1][i]` 乘目标 y）。
+- 数学口径：warp 对目标是线性的，`f(p) = H(p)·vec(targets)`，故
+  `Cov(f(p)) = H·Σ·Hᵀ` 是**精确的线性传播**，不是近似；查询位置本身
+  视为精确，其误差不混入。
+- 实现复用 `fit` 时 LU 分解（`tps2d/_linalg.py` 的 `factorize`）：影响系数
+  通过对存储分解的 n 次回代一次求出，**不对每个控制点完整重训**。
+- 非法输入（维度不符、非对称、非半正定、NaN/Inf、bool）在**任何计算之前**
+  以 `TPSInputError` 拒绝。
+
+适用范围：仅传播**目标坐标**的不确定性；源点位置、查询点位置与 `lam`
+均视为精确固定值。非线性量（如弯曲能）的误差传播不在本接口范围内。
 
 ## 错误语义（非法输入不静默纠正）
 
@@ -148,8 +190,10 @@ IEEE-754 binary64（双精度），部分主元高斯消元。测试断言口径
 ```
 tps2d/__init__.py     # 公开接口
 tps2d/core.py         # 校验、核函数、fit/warp/Jacobian/残差/弯曲能
-tps2d/_linalg.py      # 部分主元高斯消元 + 仿射秩
-tests/test_tps.py     # 38 个必要测试
+tps2d/_linalg.py      # LU 分解（可复用）+ 部分主元消元 + 仿射秩
+tests/test_tps.py     # 38 个基线必要测试
+tests/test_uncertainty.py  # 15 个协方差传播测试（手算对照 + 确定性扰动核对）
 tests/_reference.py   # 仅供测试的独立参考实现
 demo.py               # 固定输入演示（正常结果 + 实际触发的拒绝）
+demo_iteration.py     # 协方差传播演示（相关误差、扰动核对、非法拒绝）
 ```

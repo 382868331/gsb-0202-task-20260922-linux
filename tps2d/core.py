@@ -22,13 +22,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from ._linalg import solve_linear, affine_rank, SingularMatrixError
+from ._linalg import factorize, affine_rank, SingularMatrixError
 
 __all__ = [
     "MAX_CONTROL_POINTS",
     "TPSInputError",
     "DegeneratePointsError",
     "TPSFitResult",
+    "TPSPrediction",
     "TPSWarp",
     "fit",
 ]
@@ -81,6 +82,80 @@ def _check_points(points, name):
     return cleaned
 
 
+# ---------------------------------------------------------------------------
+# Covariance validation
+# ---------------------------------------------------------------------------
+
+def _check_covariance(cov, dim, name="target_cov"):
+    """Validate a symmetric positive-semidefinite covariance matrix.
+
+    Returns a cleaned list-of-lists of floats.  Zero eigenvalue directions
+    are allowed (semidefinite); asymmetric or indefinite matrices, wrong
+    shapes, non-finite entries and booleans are rejected *before* any
+    computation with a locatable TPSInputError.
+    """
+    if not isinstance(cov, (list, tuple)) or len(cov) != dim:
+        raise TPSInputError(
+            f"{name} must be a {dim}x{dim} matrix, got "
+            f"{len(cov) if isinstance(cov, (list, tuple)) else type(cov).__name__} rows"
+        )
+    mat = []
+    for i, row in enumerate(cov):
+        if not isinstance(row, (list, tuple)) or len(row) != dim:
+            raise TPSInputError(
+                f"{name}[{i}] must have {dim} columns, got "
+                f"{len(row) if isinstance(row, (list, tuple)) else type(row).__name__}"
+            )
+        mat.append([_finite_float(v, f"{name}[{i}][{j}]") for j, v in enumerate(row)])
+
+    scale = 0.0
+    for row in mat:
+        for value in row:
+            if abs(value) > scale:
+                scale = abs(value)
+    sym_tol = 1e-9 * (scale if scale > 0.0 else 1.0)
+    for i in range(dim):
+        for j in range(i + 1, dim):
+            if abs(mat[i][j] - mat[j][i]) > sym_tol:
+                raise TPSInputError(
+                    f"{name} must be symmetric: [{i}][{j}]={mat[i][j]} vs "
+                    f"[{j}][{i}]={mat[j][i]}"
+                )
+
+    # Positive-semidefinite check via Cholesky with zero-pivot handling.
+    # A (near-)zero pivot is only acceptable when the whole remaining
+    # column of the Schur complement vanishes (zero eigenvalue direction).
+    psd_tol = 1e-9 * (scale if scale > 0.0 else 1.0)
+    lower = [[0.0] * dim for _ in range(dim)]
+    for k in range(dim):
+        d = mat[k][k]
+        for j in range(k):
+            d -= lower[k][j] * lower[k][j]
+        if d < -psd_tol:
+            raise TPSInputError(
+                f"{name} is not positive semidefinite: negative pivot "
+                f"{d:.6e} at row {k}"
+            )
+        if d <= psd_tol:
+            # Zero eigenvalue direction: the residual column must vanish.
+            for i in range(k + 1, dim):
+                off = mat[i][k]
+                for j in range(k):
+                    off -= lower[i][j] * lower[k][j]
+                if abs(off) > psd_tol:
+                    raise TPSInputError(
+                        f"{name} is not positive semidefinite: zero pivot at "
+                        f"row {k} but residual column entry {off:.6e} at row {i}"
+                    )
+            continue
+        lkk = math.sqrt(d)
+        lower[k][k] = lkk
+        for i in range(k + 1, dim):
+            off = mat[i][k]
+            for j in range(k):
+                off -= lower[i][j] * lower[k][j]
+            lower[i][k] = off / lkk
+    return mat
 # ---------------------------------------------------------------------------
 # Kernel
 # ---------------------------------------------------------------------------
@@ -136,10 +211,129 @@ class TPSFitResult:
     rank: int
     merged_count: int
 
+    # Fixed-design system retained for predict_with_covariance().  These
+    # are populated by fit() and are not part of the public contract.
+    _factor: object = None
+    _center: tuple = (0.0, 0.0)
+    _scale: float = 1.0
+    _nsrc: list = None
+
     @property
     def coefficients(self):
         """Tuple ``(weights, affine)`` exactly as stored."""
         return self.weights, self.affine
+
+    # -- uncertainty propagation (fixed design, linear in the targets) -----
+
+    def predict_with_covariance(self, points, target_cov):
+        """Predict query points with covariance propagated from the targets.
+
+        The control-point *positions* are fixed (the fitted system is the
+        fixed design); only the target coordinates are uncertain, with
+        covariance target_cov (a 2n x 2n symmetric positive-semidefinite
+        matrix over the merged targets stacked as
+        [x1, y1, x2, y2, ..., xn, yn]).  Correlated errors between
+        control points are fully honoured through the off-diagonal blocks.
+
+        Because the warp is linear in the targets, the prediction is exact
+        linear propagation: f(p) = H(p) @ vec(targets) with a 2 x 2n
+        influence matrix H, so Cov(f(p)) = H target_cov H^T.  The
+        factorisation computed during fit() is reused; no refit happens.
+        The query position itself is treated as exact.
+
+        Returns a TPSPrediction with means, covariances (2x2 per query)
+        and influence (per query [[hx_1..hx_n], [hy_1..hy_n]]).
+        """
+        clean = _check_points(points, 'points')
+        n = self.merged_count
+        cov = _check_covariance(target_cov, 2 * n)
+
+        factor = self._factor
+        if factor is None:  # defensive: result built without a system
+            raise TPSInputError(
+                "this TPSFitResult carries no factorisation; refit with fit()"
+            )
+        cx, cy = self._center
+        s = self._scale
+        size = n + 3
+
+        # Influence columns M = A^-1 E (E selects the target rows), computed
+        # once per call by re-solving against the stored factorisation.
+        cols = [
+            [1.0 if r == k else 0.0 for r in range(size)] for k in range(n)
+        ]
+        M = factor.solve(cols)
+
+        means = []
+        covariances = []
+        influence = []
+        for (x, y) in clean:
+            nx = (x - cx) / s
+            ny = (y - cy) / s
+            basis = [
+                _U(nx - px, ny - py) for (px, py) in self._nsrc
+            ] + [1.0, nx, ny]
+            h = [0.0] * n
+            for k in range(n):
+                col = M[k]
+                acc = 0.0
+                for r in range(size):
+                    acc += basis[r] * col[r]
+                h[k] = acc
+            # f_user = s * f~ and v~ = v / s, so the same h applies to the
+            # user-unit targets directly (the scale factors cancel).  The
+            # two output coordinates share one system matrix, hence one h.
+            influence.append([list(h), list(h)])
+
+            # Mean from the fitted warp (identical to h . v up to round-off).
+            means.append(self.warp.evaluate([x, y]))
+
+            # Covariance: H is 2 x 2n with H[0][2k] = h[k] and
+            # H[1][2k+1] = h[k]; C = H cov H^T (2x2).
+            c00 = c01 = c11 = 0.0
+            for i in range(n):
+                hi = h[i]
+                row_x = cov[2 * i]
+                row_y = cov[2 * i + 1]
+                for j in range(n):
+                    hj = h[j]
+                    c00 += hi * row_x[2 * j] * hj
+                    c01 += hi * row_x[2 * j + 1] * hj
+                    c11 += hi * row_y[2 * j + 1] * hj
+            covariances.append([[c00, c01], [c01, c11]])
+
+        return TPSPrediction(
+            points=[[p[0], p[1]] for p in clean],
+            means=means,
+            covariances=covariances,
+            influence=influence,
+        )
+
+
+@dataclass
+class TPSPrediction:
+    """Prediction with propagated target covariance at query points.
+
+    Attributes
+    ----------
+    points:
+        The validated query points (echoed back as floats).
+    means:
+        Predicted [x', y'] per query point; identical to warp.evaluate.
+    covariances:
+        2x2 covariance of the prediction per query point, propagated from
+        the target covariance under the fixed-design linear model.
+    influence:
+        Per query point a 2 x n list of influence weights:
+        influence[q][0][i] multiplies target x of control point i,
+        influence[q][1][i] multiplies target y.  The query position
+        itself carries no uncertainty.
+    """
+
+    points: list
+    means: list
+    covariances: list
+    influence: list
 
 
 @dataclass
@@ -358,7 +552,8 @@ def fit(sources, targets, lam=0.0):
     rhs_y = [t[1] for t in ntgt] + [0.0, 0.0, 0.0]
 
     try:
-        sol_x, sol_y = solve_linear(A, [rhs_x, rhs_y])
+        factor = factorize(A)
+        sol_x, sol_y = factor.solve([rhs_x, rhs_y])
     except SingularMatrixError as exc:
         # rank(P) >= 3 guarantees the block system is invertible for
         # lam~ >= 0 with the positive semidefinite TPS K; reaching here means
@@ -429,4 +624,8 @@ def fit(sources, targets, lam=0.0):
         bending_energy=energy,
         rank=rank,
         merged_count=n,
+        _factor=factor,
+        _center=(cx, cy),
+        _scale=s,
+        _nsrc=nsrc,
     )
