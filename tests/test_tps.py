@@ -370,5 +370,213 @@ class KernelConventionTests(unittest.TestCase):
         self.assertAlmostEqual(out[1], -0.5, delta=1e-9)
 
 
+def point_major_covariance(blocks, cross_blocks=None):
+    """Build a 2n x 2n covariance in [x0,y0,x1,y1,...] order."""
+    n = len(blocks)
+    mat = [[0.0] * (2 * n) for _ in range(2 * n)]
+    for i, block in enumerate(blocks):
+        for a in range(2):
+            for b in range(2):
+                mat[2 * i + a][2 * i + b] = block[a][b]
+    if cross_blocks:
+        for i, j, block in cross_blocks:
+            for a in range(2):
+                for b in range(2):
+                    value = float(block[a][b])
+                    mat[2 * i + a][2 * j + b] = value
+                    mat[2 * j + b][2 * i + a] = value
+    return mat
+
+
+class CovariancePropagationTests(unittest.TestCase):
+    def setUp(self):
+        self.sources = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+        self.targets = [list(p) for p in self.sources]
+        self.result = fit(self.sources, self.targets, lam=0.0)
+        self.point = [4.0, 5.0]
+
+    def test_affine_degenerate_three_points_by_hand(self):
+        # With three non-collinear controls TPS has no bending part.  The
+        # affine cardinal weights at (4, 5) are (-8, 4, 5).
+        prediction = self.result.predict(
+            self.point,
+            point_major_covariance([
+                [[0.03, 0.0], [0.0, 0.07]],
+                [[0.03, 0.0], [0.0, 0.07]],
+                [[0.03, 0.0], [0.0, 0.07]],
+            ]),
+        )
+        expected_h = [-8.0, 4.0, 5.0]
+        for block, got in zip(expected_h, prediction.influence):
+            self.assertAlmostEqual(got[0][0], block, delta=1e-10)
+            self.assertAlmostEqual(got[1][1], block, delta=1e-10)
+            self.assertAlmostEqual(got[0][1], 0.0, delta=1e-12)
+            self.assertAlmostEqual(got[1][0], 0.0, delta=1e-12)
+
+        variance_x = sum(h * h for h in expected_h) * 0.03
+        variance_y = sum(h * h for h in expected_h) * 0.07
+        self.assertEqual(prediction.mean, [4.0, 5.0])
+        self.assertAlmostEqual(prediction.covariance[0][0], variance_x, delta=1e-9)
+        self.assertAlmostEqual(prediction.covariance[1][1], variance_y, delta=1e-9)
+        self.assertAlmostEqual(prediction.covariance[0][1], 0.0, delta=1e-12)
+
+    def test_fully_correlated_translation_error(self):
+        # Every target has exactly the same random translation vector.  A TPS
+        # reproduces it as a pure translation at every query point.
+        translation_block = [[0.09, 0.06], [0.06, 0.04]]
+        covariance = point_major_covariance(
+            [translation_block for _ in self.sources],
+            [
+                (0, 1, translation_block),
+                (0, 2, translation_block),
+                (1, 2, translation_block),
+            ],
+        )
+        prediction = self.result.predict(self.point, covariance)
+        self.assertEqual(sum(h[0][0] for h in prediction.influence), 1.0)
+        self.assertEqual(sum(h[1][1] for h in prediction.influence), 1.0)
+        for i in range(2):
+            for j in range(2):
+                self.assertAlmostEqual(
+                    prediction.covariance[i][j],
+                    translation_block[i][j],
+                    delta=1e-10,
+                )
+
+    def test_independent_noise_and_cross_coordinate_correlation(self):
+        blocks = [
+            [[0.10, 0.02], [0.02, 0.20]],
+            [[0.30, -0.05], [-0.05, 0.40]],
+            [[0.50, 0.08], [0.08, 0.60]],
+        ]
+        prediction = self.result.predict(
+            self.point, point_major_covariance(blocks)
+        )
+        h = [-8.0, 4.0, 5.0]
+        expected = [[0.0, 0.0], [0.0, 0.0]]
+        for i, hi in enumerate(h):
+            expected[0][0] += hi * blocks[i][0][0] * hi
+            expected[0][1] += hi * blocks[i][0][1] * hi
+            expected[1][1] += hi * blocks[i][1][1] * hi
+        expected[1][0] = expected[0][1]
+        self.assertTrue(all(math.isfinite(v) for row in prediction.covariance for v in row))
+        for i in range(2):
+            for j in range(2):
+                self.assertAlmostEqual(
+                    prediction.covariance[i][j], expected[i][j], delta=1e-9
+                )
+
+    def test_cross_control_correlation_uses_full_matrix(self):
+        n = len(self.sources)
+        covariance = point_major_covariance(
+            [[[1.0, 0.25], [0.25, 1.0]] for _ in range(n)],
+            [
+                (0, 1, [[0.50, -0.20], [0.10, 0.40]]),
+                (0, 2, [[-0.30, 0.15], [0.20, 0.10]]),
+                (1, 2, [[0.20, 0.30], [-0.10, -0.40]]),
+            ],
+        )
+        prediction = self.result.predict(self.point, covariance)
+        h = [-8.0, 4.0, 5.0]
+        expected = [[0.0, 0.0], [0.0, 0.0]]
+        for i in range(n):
+            for j in range(n):
+                for a in range(2):
+                    for b in range(2):
+                        weight_i = h[i]
+                        weight_j = h[j]
+                        expected[a][b] += (
+                            weight_i * covariance[2 * i + a][2 * j + b] * weight_j
+                        )
+        for i in range(2):
+            for j in range(2):
+                self.assertAlmostEqual(
+                    prediction.covariance[i][j], expected[i][j], delta=1e-9
+                )
+
+    def test_fixed_deterministic_perturbations_match_linear_model(self):
+        perturbations = [
+            [[0.10, -0.20], [-0.05, 0.15], [0.30, 0.05]],
+            [[-0.20, 0.10], [0.25, -0.05], [0.10, 0.40]],
+        ]
+        for delta in perturbations:
+            vector = [value for point_delta in delta for value in point_delta]
+            covariance = [[vector[i] * vector[j] for j in range(6)] for i in range(6)]
+            prediction = self.result.predict(self.point, covariance)
+
+            shifted = [
+                [base[0] + d[0], base[1] + d[1]]
+                for base, d in zip(self.targets, delta)
+            ]
+            shifted_prediction = fit(self.sources, shifted).warp.evaluate(self.point)
+            expected_delta = [
+                sum(prediction.influence[i][a][a] * delta[i][a] for i in range(3))
+                for a in range(2)
+            ]
+            for a in range(2):
+                self.assertAlmostEqual(
+                    shifted_prediction[a] - self.point[a],
+                    expected_delta[a],
+                    delta=1e-10,
+                )
+                self.assertAlmostEqual(
+                    prediction.covariance[a][a],
+                    expected_delta[a] * expected_delta[a],
+                    delta=1e-11,
+                )
+            self.assertAlmostEqual(
+                prediction.covariance[0][1],
+                expected_delta[0] * expected_delta[1],
+                delta=1e-11,
+            )
+
+    def test_zero_covariance_is_allowed_and_means_no_target_uncertainty(self):
+        prediction = self.result.predict(
+            self.point, [[0.0] * 6 for _ in range(6)]
+        )
+        self.assertEqual(prediction.covariance, [[0.0, 0.0], [0.0, 0.0]])
+
+    def test_invalid_covariance_rejected_before_propagation(self):
+        good_zero = [[0.0] * 6 for _ in range(6)]
+        bad_cases = [
+            [[0.0] * 6 for _ in range(5)],
+            [[float("nan")] * 6 for _ in range(6)],
+            point_major_covariance([
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[-1.0, 0.0], [0.0, 1.0]],
+            ]),
+        ]
+        for bad in bad_cases:
+            with self.assertRaises(TPSInputError):
+                self.result.predict(self.point, bad)
+
+        asymmetric = point_major_covariance([
+            [[1.0, 0.0], [0.0, 1.0]] for _ in range(3)
+        ])
+        asymmetric[0][1] = 0.5
+        with self.assertRaises(TPSInputError):
+            self.result.predict(self.point, asymmetric)
+
+        with self.assertRaises(TPSInputError):
+            self.result.predict([float("nan"), 0.0], good_zero)
+
+    def test_non_affine_design_reuses_fixed_factor_and_interpolating_weights(self):
+        sources = grid_points(4, 4)
+        targets = [
+            [x + 0.2 * math.sin(y), y + 0.1 * math.cos(x)]
+            for x, y in sources
+        ]
+        result = fit(sources, targets)
+        prediction = result.predict(sources[5], [[0.0] * 32 for _ in range(32)])
+        # At a control point, interpolation makes its influence a 2-D identity
+        # and all other control-point influences vanish.
+        for i, block in enumerate(prediction.influence):
+            expected_diagonal = 1.0 if i == 5 else 0.0
+            self.assertAlmostEqual(block[0][0], expected_diagonal, delta=1e-8)
+            self.assertAlmostEqual(block[1][1], expected_diagonal, delta=1e-8)
+        self.assertIsNotNone(result._fixed_design[0])
+
+
 if __name__ == "__main__":
     unittest.main()

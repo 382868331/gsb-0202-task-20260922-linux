@@ -20,15 +20,22 @@ merging) raise `DegeneratePointsError`.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from ._linalg import solve_linear, affine_rank, SingularMatrixError
+from ._linalg import (
+    lu_factor,
+    lu_solve,
+    affine_rank,
+    is_symmetric_psd,
+    SingularMatrixError,
+)
 
 __all__ = [
     "MAX_CONTROL_POINTS",
     "TPSInputError",
     "DegeneratePointsError",
     "TPSFitResult",
+    "TPSPrediction",
     "TPSWarp",
     "fit",
 ]
@@ -42,6 +49,9 @@ class TPSInputError(ValueError):
 
 class DegeneratePointsError(TPSInputError):
     """Affine design matrix rank < 3 (collinear / insufficient points)."""
+
+
+_NUMERIC_SYM_TOL = 100.0 * 2.220446049250313e-16
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +91,44 @@ def _check_points(points, name):
     return cleaned
 
 
+def _check_covariance_matrix(matrix, size, name):
+    if not isinstance(matrix, (list, tuple)):
+        raise TPSInputError(f"{name} must be a list/tuple of numeric rows")
+    if len(matrix) != size:
+        raise TPSInputError(
+            f"{name} must be {size} x {size} for {size // 2} target points, "
+            f"got {len(matrix)} rows"
+        )
+
+    cleaned = []
+    scale = 0.0
+    for i, row in enumerate(matrix):
+        if not isinstance(row, (list, tuple)) or len(row) != size:
+            raise TPSInputError(
+                f"{name}[{i}] must be a {size}-element numeric row, got {row!r}"
+            )
+        clean_row = []
+        for j, value in enumerate(row):
+            clean_row.append(_finite_float(value, f"{name}[{i}][{j}]"))
+            scale = max(scale, abs(clean_row[-1]))
+        cleaned.append(clean_row)
+
+    sym_tol = max(_NUMERIC_SYM_TOL * scale, 100.0 * _NUMERIC_SYM_TOL)
+    for i in range(size):
+        for j in range(i + 1, size):
+            if abs(cleaned[i][j] - cleaned[j][i]) > sym_tol:
+                raise TPSInputError(
+                    f"{name} must be symmetric: [{i}][{j}]={cleaned[i][j]} "
+                    f"differs from [{j}][{i}]={cleaned[j][i]}"
+                )
+            avg = 0.5 * (cleaned[i][j] + cleaned[j][i])
+            cleaned[i][j] = cleaned[j][i] = avg
+
+    if not is_symmetric_psd(cleaned, tolerance=sym_tol):
+        raise TPSInputError(f"{name} must be symmetric positive semidefinite")
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Kernel
 # ---------------------------------------------------------------------------
@@ -94,9 +142,57 @@ def _U(dx, dy):
     return 0.5 * r2 * math.log(r2)
 
 
+def _snap_psd_2x2(mat):
+    """Remove only round-off-scale negative eigenvalues from H C H^T."""
+    a, b = mat[0]
+    c, d = mat[1]
+    b = c = 0.5 * (b + c)
+    a += 0.0
+    d += 0.0
+    trace = a + d
+    discriminant = (a - d) * (a - d) + 4.0 * b * b
+    spread = math.sqrt(max(0.0, discriminant))
+    lambda_min = 0.5 * (trace - spread)
+    scale = max(1.0, abs(a), abs(d), abs(b))
+    rounding_tol = 1000.0 * 2.220446049250313e-16 * scale
+
+    if lambda_min >= -rounding_tol and lambda_min < 0.0:
+        if spread <= rounding_tol:
+            a = d = max(0.0, 0.5 * trace)
+            b = c = 0.0
+        else:
+            correction = -lambda_min
+            a += correction
+            d += correction
+    return [[max(0.0, a), b], [c, max(0.0, d)]]
+
+
 # ---------------------------------------------------------------------------
 # Result container
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TPSPrediction:
+    """Mean prediction and target-error covariance at one query point."""
+
+    mean: list
+    covariance: list
+    influence: list
+
+    @property
+    def influence_matrix(self):
+        """2 x 2n influence matrix in point-major target order.
+
+        Columns are ordered ``[x_0, y_0, x_1, y_1, ...]``.  Thus
+        ``mean_error = influence_matrix @ target_error``.
+        """
+        row_x = []
+        row_y = []
+        for block in self.influence:
+            row_x.extend((block[0][0], block[0][1]))
+            row_y.extend((block[1][0], block[1][1]))
+        return [row_x, row_y]
+
 
 @dataclass
 class TPSFitResult:
@@ -135,11 +231,91 @@ class TPSFitResult:
     bending_energy: float
     rank: int
     merged_count: int
+    _fixed_design: object = field(default=None, repr=False, compare=False)
 
     @property
     def coefficients(self):
         """Tuple ``(weights, affine)`` exactly as stored."""
         return self.weights, self.affine
+
+    def influence_at(self, point):
+        """Return per-control-point influence blocks for one query point.
+
+        Each block is a 2 x 2 Jacobian of the predicted x/y with respect to
+        that control point's target x/y.  Source positions are treated as
+        fixed; only target-coordinate uncertainty is propagated.
+        """
+        if self._fixed_design is None:
+            raise TPSInputError("this fitted result does not contain a fixed design")
+
+        factor, nsrc, center, scale = self._fixed_design
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise TPSInputError("point must be a 2-element [x, y] pair")
+        x = _finite_float(point[0], "point.x")
+        y = _finite_float(point[1], "point.y")
+
+        nx = (x - center[0]) / scale
+        ny = (y - center[1]) / scale
+        n = len(nsrc)
+        query_basis = [_U(nx - sx, ny - sy) for sx, sy in nsrc]
+        query_basis.extend((1.0, nx, ny))
+        right_sides = []
+        for j in range(n):
+            rhs = [0.0] * (n + 3)
+            rhs[j] = 1.0
+            right_sides.append(rhs)
+        responses = lu_solve(factor, right_sides)
+
+        influences = []
+        for response in responses:
+            value = sum(
+                query_basis[k] * response[k] for k in range(n + 3)
+            )
+            influences.append([[value, 0.0], [0.0, value]])
+        return influences
+
+    def predict(self, point, target_covariance):
+        """Predict a point and propagate fixed-design target covariance.
+
+        ``target_covariance`` is a ``2n x 2n`` finite, real, symmetric positive
+        semidefinite matrix using point-major order
+        ``[x_0, y_0, x_1, y_1, ...]`` for the ``merged_count`` target points.
+        Correlations between different control points and between x/y are
+        allowed.  The query point itself is deterministic and is not included
+        in the returned covariance.
+        """
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise TPSInputError("point must be a 2-element [x, y] pair")
+        x = _finite_float(point[0], "point.x")
+        y = _finite_float(point[1], "point.y")
+
+        n = self.merged_count
+        size = 2 * n
+        covariance = _check_covariance_matrix(
+            target_covariance, size, "target_covariance"
+        )
+
+        # Validate/query with the fixed design before performing propagation.
+        influence = self.influence_at([x, y])
+        hx = [block[0][0] for block in influence]
+        hy = [block[1][1] for block in influence]
+
+        cxx = 0.0
+        cxy = 0.0
+        cyy = 0.0
+        for i in range(n):
+            for j in range(n):
+                cxx += hx[i] * covariance[2 * i][2 * j] * hx[j]
+                cxy += hx[i] * covariance[2 * i][2 * j + 1] * hy[j]
+                cyy += hy[i] * covariance[2 * i + 1][2 * j + 1] * hy[j]
+
+        mean = self.warp.evaluate([x, y])
+        out_cov = _snap_psd_2x2([[cxx, cxy], [cxy, cyy]])
+        return TPSPrediction(
+            mean=mean,
+            covariance=out_cov,
+            influence=influence,
+        )
 
 
 @dataclass
@@ -358,7 +534,8 @@ def fit(sources, targets, lam=0.0):
     rhs_y = [t[1] for t in ntgt] + [0.0, 0.0, 0.0]
 
     try:
-        sol_x, sol_y = solve_linear(A, [rhs_x, rhs_y])
+        factor = lu_factor(A)
+        sol_x, sol_y = lu_solve(factor, [rhs_x, rhs_y])
     except SingularMatrixError as exc:
         # rank(P) >= 3 guarantees the block system is invertible for
         # lam~ >= 0 with the positive semidefinite TPS K; reaching here means
@@ -429,4 +606,5 @@ def fit(sources, targets, lam=0.0):
         bending_energy=energy,
         rank=rank,
         merged_count=n,
+        _fixed_design=(factor, nsrc, (cx, cy), diameter),
     )

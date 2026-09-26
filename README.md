@@ -11,14 +11,22 @@
 - 网络 / 账号 / 密钥 / 数据库 / 中间件 / 云 API / Docker：均不需要
 
 ```bash
-# 必要测试（38 个用例）
+# 可选但推荐：在仓库根目录建立隔离 venv
+python -m venv .venv
+source .venv/bin/activate
+
+# 必要测试（46 个用例）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（约 0.03 秒，上限要求约 8 秒内）
 python demo.py
+
+# 固定设计下目标坐标误差传播演示（实测约 0.01 秒，要求 90 秒内）
+python demo_iteration.py
 ```
 
-两条命令都在仓库根目录执行，全程离线、无 `sleep`、无预录结果。
+所有命令都在仓库根目录执行，全程离线、无 `sleep`、无账号或密钥、无预录结果。
+即使不创建 venv 也可直接运行；上面的隔离环境只使用本机 Python 标准库。
 
 ## 数学定义
 
@@ -77,8 +85,56 @@ warp.warp_points([[x,y], ...]) # -> [[x',y'], ...]，批处理
 warp.jacobian([x, y])          # -> 2×2 [[dfx/dx, dfx/dy],[dfy/dx, dfy/dy]]
 ```
 
+预测均值、协方差和影响权重：
+
+```python
+from tps2d import fit
+
+result = fit(sources, targets, lam=0.0)
+
+# 点主序（point-major）2n×2n 协方差：
+# 行列顺序为 [x'_0, y'_0, x'_1, y'_1, ...]
+prediction = result.predict([x, y], target_covariance)
+
+prediction.mean              # [fx, fy]
+prediction.covariance        # 2×2 对称半正定矩阵
+prediction.influence         # n 个 2×2 影响块
+prediction.influence_matrix  # 等价的 2×2n 矩阵
+```
+
+`influence[i]` 表示第 i 个目标点的 x/y 扰动对查询输出 x/y 的线性影响。
+若只想取影响权重而不提供协方差，可调用 `result.influence_at([x, y])`。
+重复源点且目标相同会先合并；协方差矩阵按合并后的 `result.merged_count`
+个目标点提供。
+
+协方差在任何求解或传播前校验：必须是有限实数组成的 `2n×2n` 对称半正定矩阵；
+零矩阵允许，表示目标坐标没有不确定性。维度错误、非数值、非有限值、非对称或
+存在负方向都会抛出 `TPSInputError`。
+
 Jacobian 由核函数解析导数给出：`∂U/∂x = dx·(ln r² + 1)`，在控制点处（r=0）
 方向导数取 0，结果有限。
+
+### 固定设计下的目标坐标误差传播
+
+源控制点位置视为**固定设计**，不给源位置加噪声；只有目标坐标有随机误差。令目标向量
+
+```
+z = [x'_0, y'_0, x'_1, y'_1, ..., x'_{n-1}, y'_{n-1}]ᵀ,
+Cov(z) = C
+```
+
+TPS 参数对目标值是线性的。拟合时复用固定 TPS 矩阵的同一次部分主元 LU 分解，
+对每个目标单位扰动 `e_j` 求响应，再用查询点 `q` 的基函数投影成影响系数
+`H(q)`。不需要为每个控制点重新拟合：
+
+```
+μ(q) = 拟合均值在 q 处的输出
+δf(q) = H(q) δz
+Cov[f(q)] = H(q) C H(q)ᵀ
+```
+
+`C` 允许控制点之间相关，也允许同一控制点的 x/y 相关，因此传播使用完整矩阵，
+不是只累加对角方差。查询位置 `q` 本身必须是确定输入，其定位误差不会混入结果。
 
 ## 错误语义（非法输入不静默纠正）
 
@@ -133,7 +189,10 @@ IEEE-754 binary64（双精度），部分主元高斯消元。测试断言口径
 - 测试期望值来自闭式构造（已知仿射）或 `tests/_reference.py` 中**从零另写**
   的独立参考（独立核函数、独立 Gauss-Jordan 消元、独立组装），被测核心
   从不用于产生自己的期望值；往返一致性检查仅作补充；
-- 不提供图像重采样 / 浏览器 / GUI，本模块只做点对曲面的 fit、warp 与导数。
+- 协方差传播是固定设计线性传播：源控制点位置固定、目标误差与设计无关，
+  不覆盖源点扰动、输入查询点定位误差、非线性鲁棒拟合或贝叶斯超参数估计；
+- 不提供图像重采样 / 浏览器 / GUI，本模块只做点对曲面的 fit、warp、导数与
+  固定设计目标误差协方差传播。
 
 ## 已知限制
 
@@ -149,7 +208,8 @@ IEEE-754 binary64（双精度），部分主元高斯消元。测试断言口径
 tps2d/__init__.py     # 公开接口
 tps2d/core.py         # 校验、核函数、fit/warp/Jacobian/残差/弯曲能
 tps2d/_linalg.py      # 部分主元高斯消元 + 仿射秩
-tests/test_tps.py     # 38 个必要测试
+tests/test_tps.py     # 46 个必要测试
 tests/_reference.py   # 仅供测试的独立参考实现
 demo.py               # 固定输入演示（正常结果 + 实际触发的拒绝）
+demo_iteration.py     # 协方差传播与确定性扰动离线核对演示
 ```
