@@ -11,7 +11,7 @@
 - 网络 / 账号 / 密钥 / 数据库 / 中间件 / 云 API / Docker：均不需要
 
 ```bash
-# 必要测试（38 个用例）
+# 必要测试（43 个用例）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（约 0.03 秒，上限要求约 8 秒内）
@@ -44,9 +44,21 @@ U(r) = r²·log(r),   U(0) = 0
 ## 公开接口
 
 ```python
-from tps2d import fit, TPSInputError, DegeneratePointsError, MAX_CONTROL_POINTS
+from tps2d import (
+    fit, TPSFitter, TPSFitCache,
+    TPSInputError, DegeneratePointsError, MAX_CONTROL_POINTS,
+)
 
 result = fit(sources, targets, lam=0.0)
+
+# 反复拖动目标点时复用同一 K/P 组装与 LU 分解
+cache = TPSFitCache()
+result = fit(sources, targets_0, lam=0.1, cache=cache)
+result = fit(sources, targets_1, lam=0.1, cache=cache)
+
+# 也可使用状态接口；目标更新失败后 fitter.last_result 保持上一份有效结果
+fitter = TPSFitter(sources, targets_0, lam=0.1)
+result = fitter.update_targets(targets_1)
 ```
 
 - `sources` / `targets`：`list[list[float, float]]`，长度 1～40 且相等。
@@ -67,6 +79,14 @@ result = fit(sources, targets, lam=0.0)
 | `bending_energy` | 弯曲能二次型 `wᵀKw`，两输出坐标求和；纯仿射时为 0 |
 | `rank` | 仿射设计矩阵 P 的数值秩（合法拟合恒为 3） |
 | `merged_count` | 合并同目标重复点后的不同源点个数 |
+| `cache_hit` | 本次求解是否复用了已缓存的源点/正则相关计算 |
+| `reused_components` | 实际复用组件名称元组；未命中缓存时为空元组 |
+
+源点与 `lam` 不变时，复用内容为重复源分组、归一化、仿射秩检查、
+K 矩阵组装、含正则矩阵组装、LU 分解和主元置换；缓存查找仍会进行必要的源点格式校验。
+目标点改变只重新做右端项组装、前后向回代、系数换算、残差和弯曲能计算。
+任一源坐标或 `lam` 改变都会重建缓存；
+`TPSFitter.update_targets()` 的目标校验/重复点冲突失败不会替换 `last_result`。
 
 `TPSWarp` 方法：
 
@@ -121,7 +141,8 @@ IEEE-754 binary64（双精度），部分主元高斯消元。测试断言口径
 
 - **自带稠密线性求解器**（`tps2d/_linalg.py`）：系统最大 43 阶，纯 Python O(n³)
   消元耗时为毫秒级，换取零依赖、可审计；
-- 两输出坐标共用同一次消元（多右端项），不重复分解；
+- 两输出坐标共用同一次 LU 消元（多右端项），不重复分解；源点或 `lam` 不变时，
+  同一分解还可跨多次目标点更新复用；
 - **内部归一化**：求解前把源点中心化并按点集直径 s 缩放到 [-1,1] 量级，
   目标点除以 s，正则量换算为 `lam/s²`，求解后再把系数精确换回原单位
   （利用 `U(sr)=s²U(r)+s²ln(s)r²` 与 `Pᵀw=0`，二次附加项退化为并入 a0 的
@@ -149,7 +170,7 @@ IEEE-754 binary64（双精度），部分主元高斯消元。测试断言口径
 tps2d/__init__.py     # 公开接口
 tps2d/core.py         # 校验、核函数、fit/warp/Jacobian/残差/弯曲能
 tps2d/_linalg.py      # 部分主元高斯消元 + 仿射秩
-tests/test_tps.py     # 38 个必要测试
+tests/test_tps.py     # 43 个必要测试
 tests/_reference.py   # 仅供测试的独立参考实现
 demo.py               # 固定输入演示（正常结果 + 实际触发的拒绝）
 ```

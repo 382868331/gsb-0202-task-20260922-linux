@@ -15,7 +15,15 @@ import math
 import unittest
 
 import tps2d
-from tps2d import fit, TPSInputError, DegeneratePointsError, MAX_CONTROL_POINTS
+from tps2d import (
+    fit,
+    TPSInputError,
+    DegeneratePointsError,
+    MAX_CONTROL_POINTS,
+    TPSFitter,
+    TPSFitCache,
+)
+import tps2d.core as core
 
 from _reference import reference_fit, reference_warp, finite_diff_jacobian, kernel
 
@@ -368,6 +376,98 @@ class KernelConventionTests(unittest.TestCase):
         self.assertTrue(all(math.isfinite(v) for v in out))
         self.assertAlmostEqual(out[0], 0.5, delta=1e-9)
         self.assertAlmostEqual(out[1], -0.5, delta=1e-9)
+
+
+class TargetUpdateCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.sources = [[0.0, 0.0], [4.0, 0.0], [0.0, 4.0], [3.0, 3.0]]
+        self.targets_a = [[0.2, -0.1], [4.1, 0.0], [0.0, 3.8], [3.2, 3.1]]
+        self.targets_b = [[0.0, 0.3], [3.7, 0.2], [0.2, 4.2], [2.8, 2.9]]
+
+    def assertResultsClose(self, first, second, delta=1e-11):
+        probes = [[0.5, 0.4], [3.2, 1.5], [1.0, 3.7], [-0.5, 2.2]]
+        for point in probes:
+            q1 = first.warp.evaluate(point)
+            q2 = second.warp.evaluate(point)
+            self.assertLess(abs(q1[0] - q2[0]), delta)
+            self.assertLess(abs(q1[1] - q2[1]), delta)
+        self.assertAlmostEqual(first.rms_residual, second.rms_residual, delta=delta)
+        self.assertAlmostEqual(
+            first.bending_energy, second.bending_energy, delta=delta
+        )
+
+    def test_target_update_matches_independent_fit_and_records_reuse(self):
+        fitter = TPSFitter(self.sources, self.targets_a, lam=0.7)
+        cached = fitter.update_targets(self.targets_b)
+        independent = fit(self.sources, self.targets_b, lam=0.7)
+        self.assertResultsClose(cached, independent)
+        self.assertTrue(cached.cache_hit)
+        self.assertEqual(len(cached.reused_components), 7)
+        self.assertIn("lu_factorization", cached.reused_components)
+
+    def test_lu_factorization_runs_only_when_sources_or_lam_change(self):
+        original_factor = core.lu_factor
+        calls = []
+
+        def counting_factor(matrix):
+            calls.append(1)
+            return original_factor(matrix)
+
+        core.lu_factor = counting_factor
+        try:
+            fitter = TPSFitter(self.sources, self.targets_a, lam=0.2)
+            fitter.update_targets(self.targets_b)
+            self.assertEqual(len(calls), 1)
+            fitter.fit(targets=self.targets_a)
+            self.assertEqual(len(calls), 1)
+            fitter.fit(self.sources, self.targets_b, lam=0.3)
+            self.assertEqual(len(calls), 2)
+            moved = [[x + 0.01, y] for x, y in self.sources]
+            fitter.fit(moved, self.targets_b, lam=0.3)
+            self.assertEqual(len(calls), 3)
+        finally:
+            core.lu_factor = original_factor
+
+    def test_stateless_cache_invalidates_for_lambda_and_sources(self):
+        cache = TPSFitCache()
+        first = fit(self.sources, self.targets_a, lam=0.0, cache=cache)
+        second = fit(self.sources, self.targets_b, lam=0.0, cache=cache)
+        self.assertFalse(first.cache_hit)
+        self.assertTrue(second.cache_hit)
+        third = fit(self.sources, self.targets_b, lam=1.0, cache=cache)
+        self.assertFalse(third.cache_hit)
+        moved = [[x, y + 0.1] for x, y in self.sources]
+        fourth = fit(moved, self.targets_b, lam=1.0, cache=cache)
+        self.assertFalse(fourth.cache_hit)
+        fifth = fit(moved, self.targets_a, lam=1.0, cache=cache)
+        self.assertTrue(fifth.cache_hit)
+
+    def test_bad_target_update_keeps_previous_result(self):
+        fitter = TPSFitter(self.sources, self.targets_a)
+        previous = fitter.last_result
+        with self.assertRaises(TPSInputError):
+            fitter.update_targets(self.targets_a[:-1])
+        self.assertIs(fitter.last_result, previous)
+        self.assertResultsClose(fitter.last_result, fit(self.sources, self.targets_a))
+
+        duplicate_sources = self.sources + [[4.0, 0.0]]
+        duplicate_targets_good = self.targets_a + [[4.1, 0.0]]
+        duplicate_targets_bad = self.targets_a + [[4.9, 0.0]]
+        duplicate_fitter = TPSFitter(duplicate_sources, duplicate_targets_good)
+        duplicate_previous = duplicate_fitter.last_result
+        with self.assertRaises(TPSInputError):
+            duplicate_fitter.update_targets(duplicate_targets_bad)
+        self.assertIs(duplicate_fitter.last_result, duplicate_previous)
+
+    def test_duplicate_merge_rule_remains_identical(self):
+        sources = [[0, 0], [4, 0], [0, 4], [4, 0]]
+        targets_a = [[0, 0], [4, 1], [1, 4], [4, 1]]
+        targets_b = [[0.1, 0.0], [4.2, 1.0], [1.0, 4.3], [4.2, 1.0]]
+        fitter = TPSFitter(sources, targets_a)
+        cached = fitter.update_targets(targets_b)
+        independent = fit(sources, targets_b)
+        self.assertEqual(cached.merged_count, 3)
+        self.assertResultsClose(cached, independent)
 
 
 if __name__ == "__main__":

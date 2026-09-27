@@ -22,7 +22,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from ._linalg import solve_linear, affine_rank, SingularMatrixError
+from ._linalg import lu_factor, lu_solve, affine_rank, SingularMatrixError
 
 __all__ = [
     "MAX_CONTROL_POINTS",
@@ -30,6 +30,8 @@ __all__ = [
     "DegeneratePointsError",
     "TPSFitResult",
     "TPSWarp",
+    "TPSFitter",
+    "TPSFitCache",
     "fit",
 ]
 
@@ -135,6 +137,8 @@ class TPSFitResult:
     bending_energy: float
     rank: int
     merged_count: int
+    reused_components: tuple = ()
+    cache_hit: bool = False
 
     @property
     def coefficients(self):
@@ -227,31 +231,304 @@ class TPSWarp:
 # Fitting
 # ---------------------------------------------------------------------------
 
-def _merge_duplicates(sources, targets):
-    """Collapse repeated source points.
-
-    Same source + same target -> one control point.  Same source + different
-    targets -> TPSInputError (no unique interpolant).  Returns merged lists.
-    Coordinate equality is exact (already-converted floats); callers needing
-    tolerance-based merging must pre-snap their own data.
-    """
-    seen = {}
-    order = []
-    for s, t in zip(sources, targets):
-        if s in seen:
-            if seen[s] != t:
-                raise TPSInputError(
-                    f"duplicate source point {s} maps to conflicting targets "
-                    f"{seen[s]} and {t}"
-                )
-            # identical pair: silently merge
-            continue
-        seen[s] = t
-        order.append(s)
-    return order, [seen[s] for s in order]
+@dataclass
+class _PreparedProblem:
+    raw_sources: list
+    source_points: list
+    source_indices: list
+    normalized_sources: list
+    center: tuple
+    diameter: float
+    rank: int
+    factorization: tuple
+    kernel_entries: list
 
 
-def fit(sources, targets, lam=0.0):
+def _prepare_sources(sources, lam=0.0):
+    """Build and factorise every part that depends only on sources and lam."""
+    src = _check_points(sources, "sources")
+    if len(src) > MAX_CONTROL_POINTS:
+        raise TPSInputError(
+            f"at most {MAX_CONTROL_POINTS} control points allowed, got {len(src)}"
+        )
+    lam_f = _finite_float(lam, "lam")
+    if lam_f < 0.0:
+        raise TPSInputError(f"lam must be >= 0, got {lam_f}")
+
+    unique = []
+    unique_index = {}
+    source_indices = []
+    for point in src:
+        if point not in unique_index:
+            unique_index[point] = len(unique)
+            unique.append(point)
+        source_indices.append(unique_index[point])
+
+    n = len(unique)
+    if n < 3:
+        raise DegeneratePointsError(
+            f"need at least 3 distinct source points after merging, got {n}"
+        )
+
+    cx = sum(p[0] for p in unique) / n
+    cy = sum(p[1] for p in unique) / n
+    diameter = 0.0
+    for i in range(n):
+        xi, yi = unique[i]
+        for j in range(i + 1, n):
+            d = math.hypot(xi - unique[j][0], yi - unique[j][1])
+            if d > diameter:
+                diameter = d
+    if diameter == 0.0:
+        raise DegeneratePointsError("all source points coincide")
+
+    normalized = [[(x - cx) / diameter, (y - cy) / diameter]
+                  for (x, y) in unique]
+    rank = affine_rank([[1.0, x, y] for x, y in normalized])
+    if rank < 3:
+        raise DegeneratePointsError(
+            f"affine design matrix rank is {rank} < 3: control points are "
+            f"collinear or fewer than 3 distinct points after merging"
+        )
+
+    size = n + 3
+    matrix = [[0.0] * size for _ in range(size)]
+    kernel_entries = []
+    nlam = lam_f / (diameter * diameter)
+    for i in range(n):
+        xi, yi = normalized[i]
+        for j in range(i + 1, n):
+            xj, yj = normalized[j]
+            kij = _U(xi - xj, yi - yj)
+            matrix[i][j] = kij
+            matrix[j][i] = kij
+            kernel_entries.append((i, j, kij))
+        matrix[i][i] = nlam
+        matrix[i][n] = 1.0
+        matrix[i][n + 1] = xi
+        matrix[i][n + 2] = yi
+        matrix[n][i] = 1.0
+        matrix[n + 1][i] = xi
+        matrix[n + 2][i] = yi
+
+    try:
+        factorization = lu_factor(matrix)
+    except SingularMatrixError as exc:
+        raise DegeneratePointsError(
+            f"TPS system numerically singular despite rank(P)={rank}: {exc}"
+        ) from exc
+
+    return _PreparedProblem(
+        raw_sources=src,
+        source_points=unique,
+        source_indices=source_indices,
+        normalized_sources=normalized,
+        center=(cx, cy),
+        diameter=diameter,
+        rank=rank,
+        factorization=factorization,
+        kernel_entries=kernel_entries,
+    )
+
+
+REUSED_COMPONENTS = (
+    "duplicate_source_grouping",
+    "source_normalization",
+    "affine_rank",
+    "kernel_matrix_assembly",
+    "regularized_system_assembly",
+    "lu_factorization",
+    "pivot_permutation",
+)
+
+
+def _solve_for_targets(prepared, targets, reused_components=()):
+    """Perform only target-dependent RHS assembly, substitution and metrics."""
+    checked_targets = _check_points(targets, "targets")
+    if len(checked_targets) != len(prepared.raw_sources):
+        raise TPSInputError(
+            f"sources/targets length mismatch: {len(prepared.raw_sources)} "
+            f"!= {len(checked_targets)}"
+        )
+
+    merged_targets = [None] * len(prepared.source_points)
+    for source_index, target in zip(prepared.source_indices, checked_targets):
+        existing = merged_targets[source_index]
+        if existing is None:
+            merged_targets[source_index] = target
+        elif existing != target:
+            raise TPSInputError(
+                f"duplicate source point {prepared.source_points[source_index]} "
+                f"maps to conflicting targets {existing} and {target}"
+            )
+
+    scale = prepared.diameter
+    normalized_targets = [[x / scale, y / scale] for x, y in merged_targets]
+    rhs_x = [t[0] for t in normalized_targets] + [0.0, 0.0, 0.0]
+    rhs_y = [t[1] for t in normalized_targets] + [0.0, 0.0, 0.0]
+    sol_x, sol_y = lu_solve(prepared.factorization, [rhs_x, rhs_y])
+
+    n = len(prepared.source_points)
+    nsrc = prepared.normalized_sources
+    cx, cy = prepared.center
+    ln_s = math.log(scale)
+    wx_n, ax_n = sol_x[:n], sol_x[n:]
+    wy_n, ay_n = sol_y[:n], sol_y[n:]
+
+    def affine_back(w_n, affine_n):
+        constant = ln_s * sum(
+            w_n[i] * (nsrc[i][0] * nsrc[i][0] + nsrc[i][1] * nsrc[i][1])
+            for i in range(n)
+        )
+        return [
+            scale * affine_n[0]
+            - affine_n[1] * cx
+            - affine_n[2] * cy
+            - scale * constant,
+            affine_n[1],
+            affine_n[2],
+        ]
+
+    weights_x = [value / scale for value in wx_n]
+    weights_y = [value / scale for value in wy_n]
+    affine_x = affine_back(wx_n, ax_n)
+    affine_y = affine_back(wy_n, ay_n)
+    weights = [[weights_x[i], weights_y[i]] for i in range(n)]
+    affine = [
+        [affine_x[0], affine_y[0]],
+        [affine_x[1], affine_y[1]],
+        [affine_x[2], affine_y[2]],
+    ]
+
+    warp = TPSWarp(prepared.source_points, weights, affine)
+    residuals = []
+    squared_sum = 0.0
+    for i, point in enumerate(prepared.source_points):
+        fx, fy = warp.evaluate(point)
+        ex = fx - merged_targets[i][0]
+        ey = fy - merged_targets[i][1]
+        residuals.append(math.hypot(ex, ey))
+        squared_sum += ex * ex + ey * ey
+    rms = math.sqrt(squared_sum / (2.0 * n))
+
+    energy = 0.0
+    for w_coord in (wx_n, wy_n):
+        for i, j, kij in prepared.kernel_entries:
+            energy += 2.0 * w_coord[i] * w_coord[j] * kij
+
+    return TPSFitResult(
+        warp=warp,
+        weights=weights,
+        affine=affine,
+        residuals=residuals,
+        rms_residual=rms,
+        bending_energy=energy,
+        rank=prepared.rank,
+        merged_count=n,
+        reused_components=tuple(reused_components),
+        cache_hit=bool(reused_components),
+    )
+
+
+class TPSFitCache:
+    """Reusable factorisation keyed by source points and regularisation."""
+
+    def __init__(self):
+        self._prepared = None
+        self._sources = None
+        self._lam = None
+        self.last_reused_components = ()
+
+    def get(self, sources, lam):
+        candidate_sources = _check_points(sources, "sources")
+        candidate_lam = _finite_float(lam, "lam")
+        if (
+            self._prepared is not None
+            and self._sources == candidate_sources
+            and self._lam == candidate_lam
+        ):
+            self.last_reused_components = REUSED_COMPONENTS
+            return self._prepared, REUSED_COMPONENTS
+
+        prepared = _prepare_sources(candidate_sources, candidate_lam)
+        self._prepared = prepared
+        self._sources = candidate_sources
+        self._lam = candidate_lam
+        self.last_reused_components = ()
+        return prepared, ()
+
+    def clear(self):
+        self._prepared = None
+        self._sources = None
+        self._lam = None
+        self.last_reused_components = ()
+
+
+class TPSFitter:
+    """Stateful fitter for repeated target drags with fixed source points."""
+
+    def __init__(self, sources=None, targets=None, lam=0.0):
+        self._cache = TPSFitCache()
+        self._sources = None
+        self._lam = None
+        self.last_result = None
+        if sources is not None:
+            self.set_problem(sources, targets=targets, lam=lam)
+
+    def set_sources(self, sources, lam=None):
+        checked = _check_points(sources, "sources")
+        lam_value = self._lam if lam is None else _finite_float(lam, "lam")
+        prepared = _prepare_sources(checked, lam_value)
+        self._cache._prepared = prepared
+        self._cache._sources = checked
+        self._cache._lam = lam_value
+        self._cache.last_reused_components = ()
+        self._sources = checked
+        self._lam = lam_value
+        self.last_result = None
+        return self
+
+    def set_regularization(self, lam):
+        if self._sources is None:
+            raise TPSInputError("cannot set lam before sources are initialised")
+        return self.set_sources(self._sources, lam=lam)
+
+    set_regularisation = set_regularization
+
+    def set_problem(self, sources, targets, lam=0.0):
+        self.set_sources(sources, lam=lam)
+        if targets is None:
+            raise TPSInputError("targets is required")
+        self.last_result = _solve_for_targets(self._cache._prepared, targets, ())
+        return self.last_result
+
+    def update_targets(self, targets):
+        if self._cache._prepared is None:
+            raise TPSInputError("fitter has no source points")
+        result = _solve_for_targets(
+            self._cache._prepared, targets, REUSED_COMPONENTS
+        )
+        self.last_result = result
+        return result
+
+    def fit(self, sources=None, targets=None, lam=None):
+        if sources is not None or lam is not None:
+            if targets is None:
+                raise TPSInputError("targets is required when sources or lam changes")
+            if sources is not None:
+                self.set_sources(sources, lam=self._lam if lam is None else lam)
+            else:
+                self.set_regularization(lam)
+            self.last_result = _solve_for_targets(
+                self._cache._prepared, targets, ()
+            )
+            return self.last_result
+        if targets is None:
+            raise TPSInputError("targets is required")
+        return self.update_targets(targets)
+
+
+def fit(sources, targets, lam=0.0, cache=None):
     """Fit a 2-D thin-plate spline.
 
     Parameters
@@ -264,6 +541,10 @@ def fit(sources, targets, lam=0.0):
         Regularisation parameter lambda >= 0 added as ``lambda * I`` to K.
         ``lam = 0`` interpolates the (merged) control points exactly (up to
         floating-point round-off); larger values trade fit for smoothness.
+    cache:
+        Optional `TPSFitCache`. When source points and lam are unchanged, the
+        cached normalised K/P assembly and LU factorisation are reused; only
+        RHS assembly, substitution and result metrics are recomputed.
 
     Returns
     -------
@@ -278,155 +559,8 @@ def fit(sources, targets, lam=0.0):
         Fewer than 3 distinct source points or collinear configuration
         (rank of P < 3).
     """
-    src = _check_points(sources, "sources")
-    tgt = _check_points(targets, "targets")
-    if len(src) != len(tgt):
-        raise TPSInputError(
-            f"sources/targets length mismatch: {len(src)} != {len(tgt)}"
-        )
-    if len(src) > MAX_CONTROL_POINTS:
-        raise TPSInputError(
-            f"at most {MAX_CONTROL_POINTS} control points allowed, got {len(src)}"
-        )
-    # bool is rejected inside _finite_float; also guard lam explicitly.
-    lam_f = _finite_float(lam, "lam")
-    if lam_f < 0.0:
-        raise TPSInputError(f"lam must be >= 0, got {lam_f}")
-
-    src, tgt = _merge_duplicates(src, tgt)
-    n = len(src)
-    if n < 3:
-        raise DegeneratePointsError(
-            f"need at least 3 distinct source points after merging, got {n}"
-        )
-
-    # Internal normalisation for scale robustness.  Medical pixel coordinates
-    # are commonly O(1e3..1e6), where U ~ r^2 log r makes K dominate the block
-    # matrix and a global pivot tolerance would falsely reject a small Schur
-    # complement pivot.  We centre the sources and divide by their diameter;
-    # targets are divided by the same factor.  Using U(s*r) = s^2 U(r) and
-    # sum(w)=0, the fitted coefficients are converted back exactly:
-    #     w = w~ / s,  a1 = a~1, a2 = a~2,  a0 = s*a~0 - a~1*cx - a~2*cy,
-    # and the regulariser maps to  lam~ = lam / s^2.  Residuals and the
-    # bending energy (w^T K w, scale invariant) are reported in user units.
-    cx = sum(p[0] for p in src) / n
-    cy = sum(p[1] for p in src) / n
-    diameter = 0.0
-    for i in range(n):
-        xi, yi = src[i]
-        for j in range(i + 1, n):
-            d = math.hypot(xi - src[j][0], yi - src[j][1])
-            if d > diameter:
-                diameter = d
-    if diameter == 0.0:
-        raise DegeneratePointsError("all source points coincide")
-
-    nsrc = [[(x - cx) / diameter, (y - cy) / diameter] for (x, y) in src]
-    ntgt = [[vx / diameter, vy / diameter] for (vx, vy) in tgt]
-    nlam = lam_f / (diameter * diameter)
-
-    # Rank of the (normalised, scale-independent) affine design P = [1, x, y].
-    Pn = [[1.0, sx, sy] for (sx, sy) in nsrc]
-    rank = affine_rank(Pn)
-    if rank < 3:
-        raise DegeneratePointsError(
-            f"affine design matrix rank is {rank} < 3: control points are "
-            f"collinear or fewer than 3 distinct points after merging"
-        )
-
-    # Assemble the (n+3) x (n+3) TPS system  [K+lam~ I  P; P^T 0].
-    size = n + 3
-    A = [[0.0] * size for _ in range(size)]
-    for i in range(n):
-        xi, yi = nsrc[i]
-        for j in range(i + 1, n):
-            xj, yj = nsrc[j]
-            kij = _U(xi - xj, yi - yj)
-            A[i][j] = kij
-            A[j][i] = kij
-        A[i][i] = nlam
-        # P block
-        A[i][n] = 1.0
-        A[i][n + 1] = xi
-        A[i][n + 2] = yi
-        # P^T block
-        A[n][i] = 1.0
-        A[n + 1][i] = xi
-        A[n + 2][i] = yi
-
-    rhs_x = [t[0] for t in ntgt] + [0.0, 0.0, 0.0]
-    rhs_y = [t[1] for t in ntgt] + [0.0, 0.0, 0.0]
-
-    try:
-        sol_x, sol_y = solve_linear(A, [rhs_x, rhs_y])
-    except SingularMatrixError as exc:
-        # rank(P) >= 3 guarantees the block system is invertible for
-        # lam~ >= 0 with the positive semidefinite TPS K; reaching here means
-        # the configuration is so close to degenerate that pivoting failed.
-        raise DegeneratePointsError(
-            f"TPS system numerically singular despite rank(P)={rank}: {exc}"
-        ) from exc
-
-    # Convert normalised coefficients back to the caller's units.
-    # U(s*r) = s^2 U(r) + s^2 ln(s) ||r||^2; with P^T w = 0 the quadratic
-    # extra term reduces, at every point, to the constant
-    # s*ln(s) * sum(w~_i ||c~_i||^2), which is absorbed into a0.
-    s = diameter
-    ln_s = math.log(s)
-    wx_n, ax_n = sol_x[:n], sol_x[n:]
-    wy_n, ay_n = sol_y[:n], sol_y[n:]
-
-    def _back_to_user(w_n, a_n, cxu, cyu):
-        const = ln_s * sum(
-            w_n[i] * (nsrc[i][0] * nsrc[i][0] + nsrc[i][1] * nsrc[i][1])
-            for i in range(n)
-        )
-        return [
-            s * a_n[0] - a_n[1] * cxu - a_n[2] * cyu - s * const,
-            a_n[1],
-            a_n[2],
-        ]
-
-    wx = [wi / s for wi in wx_n]
-    wy = [wi / s for wi in wy_n]
-    ax = _back_to_user(wx_n, ax_n, cx, cy)
-    ay = _back_to_user(wy_n, ay_n, cx, cy)
-    weights = [[wx[i], wy[i]] for i in range(n)]
-    affine = [[ax[0], ay[0]], [ax[1], ay[1]], [ax[2], ay[2]]]
-
-    warp = TPSWarp(control_points=src, weights=weights, affine=affine)
-
-    # Residuals at the (merged) control points, in original units.
-    residuals = []
-    sq_sum = 0.0
-    for i, pt in enumerate(src):
-        fx, fy = warp.evaluate(pt)
-        ex = fx - tgt[i][0]
-        ey = fy - tgt[i][1]
-        residuals.append(math.hypot(ex, ey))
-        sq_sum += ex * ex + ey * ey
-    rms = math.sqrt(sq_sum / (2.0 * n))
-
-    # Bending energy w~^T K~ w~ (identical to w^T K w in user units: the
-    # s^-1 and s^2 scaling cancel), summed over the two output coordinates.
-    energy = 0.0
-    for w_coord in (wx_n, wy_n):
-        acc = 0.0
-        for i in range(n):
-            xi, yi = nsrc[i]
-            for j in range(i + 1, n):
-                xj, yj = nsrc[j]
-                kij = _U(xi - xj, yi - yj)
-                acc += 2.0 * w_coord[i] * w_coord[j] * kij
-        energy += acc
-
-    return TPSFitResult(
-        warp=warp,
-        weights=weights,
-        affine=affine,
-        residuals=residuals,
-        rms_residual=rms,
-        bending_energy=energy,
-        rank=rank,
-        merged_count=n,
-    )
+    if cache is None:
+        prepared = _prepare_sources(sources, lam)
+        return _solve_for_targets(prepared, targets)
+    prepared, reused = cache.get(sources, lam)
+    return _solve_for_targets(prepared, targets, reused)

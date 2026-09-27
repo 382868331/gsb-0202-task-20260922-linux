@@ -14,6 +14,90 @@ class SingularMatrixError(ValueError):
     """Raised when elimination encounters a numerically zero pivot."""
 
 
+def lu_factor(a):
+    """Return a partial-pivot LU factorisation and pivot permutation."""
+    matrix = [list(row) for row in a]
+    n = len(matrix)
+    for row in matrix:
+        if len(row) != n:
+            raise ValueError("lu_factor expects a square matrix")
+
+    scale = 0.0
+    for row in matrix:
+        for value in row:
+            if abs(value) > scale:
+                scale = abs(value)
+    pivot_tol = n * _EPS * (scale if scale > 0.0 else 1.0)
+    pivot_rows = list(range(n))
+
+    for k in range(n):
+        pivot_row = k
+        pivot_abs = abs(matrix[k][k])
+        for i in range(k + 1, n):
+            candidate = abs(matrix[i][k])
+            if candidate > pivot_abs:
+                pivot_abs = candidate
+                pivot_row = i
+        if pivot_abs <= pivot_tol:
+            raise SingularMatrixError(
+                f"linear system is (numerically) singular: pivot {pivot_abs:.3e} "
+                f"<= tolerance {pivot_tol:.3e}"
+            )
+        if pivot_row != k:
+            matrix[k], matrix[pivot_row] = matrix[pivot_row], matrix[k]
+        pivot_rows[k] = pivot_row
+
+        pivot = matrix[k][k]
+        row_k = matrix[k]
+        for i in range(k + 1, n):
+            factor = matrix[i][k] / pivot
+            if factor == 0.0:
+                continue
+            row_i = matrix[i]
+            for j in range(k + 1, n):
+                row_i[j] -= factor * row_k[j]
+            row_i[k] = factor
+
+    return matrix, pivot_rows
+
+
+def lu_solve(factorization, rhs):
+    """Solve a factored system for one or several right-hand sides."""
+    lu, pivots = factorization
+    n = len(lu)
+    if rhs and isinstance(rhs[0], (list, tuple)):
+        columns = [list(col) for col in rhs]
+    else:
+        columns = [list(rhs)]
+    for col in columns:
+        if len(col) != n:
+            raise ValueError("rhs length must match matrix size")
+
+    for k in range(n):
+        pivot_row = pivots[k]
+        if pivot_row != k:
+            for col in columns:
+                col[k], col[pivot_row] = col[pivot_row], col[k]
+
+    solutions = []
+    for col in columns:
+        for i in range(1, n):
+            total = col[i]
+            for j in range(i):
+                total -= lu[i][j] * col[j]
+            col[i] = total
+
+        x = [0.0] * n
+        for i in range(n - 1, -1, -1):
+            total = col[i]
+            for j in range(i + 1, n):
+                total -= lu[i][j] * x[j]
+            x[i] = total / lu[i][i]
+        solutions.append(x)
+
+    return solutions[0] if len(solutions) == 1 else solutions
+
+
 def solve_linear(a, rhs):
     """Solve ``a @ x = rhs`` for one or several right-hand sides.
 
@@ -24,71 +108,11 @@ def solve_linear(a, rhs):
 
     A pivot no larger than ``n * eps * max|a_ij|`` is treated as singular.
     """
-    matrix = [list(row) for row in a]
-    n = len(matrix)
-    for row in matrix:
-        if len(row) != n:
-            raise ValueError("solve_linear expects a square matrix")
-
     if rhs and isinstance(rhs[0], (list, tuple)):
         columns = [list(col) for col in rhs]
     else:
         columns = [list(rhs)]
-    for col in columns:
-        if len(col) != n:
-            raise ValueError("rhs length must match matrix size")
-
-    scale = 0.0
-    for row in matrix:
-        for value in row:
-            if abs(value) > scale:
-                scale = abs(value)
-    pivot_tol = n * _EPS * (scale if scale > 0.0 else 1.0)
-
-    # Forward elimination with partial pivoting, applied to every rhs column.
-    for k in range(n):
-        pivot_row = k
-        pivot_abs = abs(matrix[k][k])
-        for i in range(k + 1, n):
-            cand = abs(matrix[i][k])
-            if cand > pivot_abs:
-                pivot_abs = cand
-                pivot_row = i
-        if pivot_abs <= pivot_tol:
-            raise SingularMatrixError(
-                f"linear system is (numerically) singular: pivot {pivot_abs:.3e} "
-                f"<= tolerance {pivot_tol:.3e}"
-            )
-        if pivot_row != k:
-            matrix[k], matrix[pivot_row] = matrix[pivot_row], matrix[k]
-            for col in columns:
-                col[k], col[pivot_row] = col[pivot_row], col[k]
-
-        pivot = matrix[k][k]
-        for i in range(k + 1, n):
-            factor = matrix[i][k] / pivot
-            if factor == 0.0:
-                continue
-            row_i = matrix[i]
-            row_k = matrix[k]
-            for j in range(k + 1, n):
-                row_i[j] -= factor * row_k[j]
-            row_i[k] = 0.0
-            for col in columns:
-                col[i] -= factor * col[k]
-
-    solutions = []
-    for col in columns:
-        x = [0.0] * n
-        for i in range(n - 1, -1, -1):
-            total = col[i]
-            row = matrix[i]
-            for j in range(i + 1, n):
-                total -= row[j] * x[j]
-            x[i] = total / row[i]
-        solutions.append(x)
-
-    return solutions[0] if len(solutions) == 1 else solutions
+    return lu_solve(lu_factor([list(row) for row in a]), columns)
 
 
 def affine_rank(mat, tol=1e-12):

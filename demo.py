@@ -11,7 +11,7 @@ two conflicting targets).
 import math
 import time
 
-from tps2d import fit, TPSInputError
+from tps2d import fit, TPSFitter, TPSInputError
 
 
 def build_problem():
@@ -72,6 +72,16 @@ def main():
         abs(j_ana[r][c] - j_num[r][c]) for r in range(2) for c in range(2)
     )
     print(f"\nmax |J_analytic - J_finite-diff| at {p}: {err:.3e}")
+
+    # Reuse the source-only K/P assembly and LU factorisation for a target drag.
+    dragged = [[x + 0.5, y - 0.3] for x, y in targets]
+    fitter = TPSFitter(sources, targets, lam=0.0)
+    reused = fitter.update_targets(dragged)
+    print("\n=== target update cache reuse ===")
+    print(f"cache hit: {reused.cache_hit}")
+    print("reused components: " + ", ".join(reused.reused_components))
+    dragged_q = reused.warp.evaluate(probes[0])
+    print(f"warped first probe after target drag: ({dragged_q[0]:.4f}, {dragged_q[1]:.4f})")
 
     # ---- a boundary that actually fires -------------------------------
     print("\n=== contract boundary: conflicting duplicate source ===")
