@@ -14,29 +14,21 @@ class SingularMatrixError(ValueError):
     """Raised when elimination encounters a numerically zero pivot."""
 
 
-def solve_linear(a, rhs):
-    """Solve ``a @ x = rhs`` for one or several right-hand sides.
+def lu_factor(a):
+    """Factorise ``a`` once into an LU decomposition with partial pivoting.
 
-    ``a`` is an n x n matrix (list of lists), ``rhs`` is either a flat
-    sequence (returns a flat list) or a sequence of equal-length columns
-    (returns a list of flat solution lists).  Inputs are copied; the caller's
-    matrices are never modified.
-
-    A pivot no larger than ``n * eps * max|a_ij|`` is treated as singular.
+    The returned object can be reused for any number of right-hand sides via
+    `lu_solve`; this is the cacheable part of a TPS refit when the source
+    control points and regularisation (hence the system matrix) are fixed and
+    only the targets change.  The factorisation stores the elimination
+    multipliers below the diagonal, the upper factor on/above it, and the
+    pivot row swaps applied during elimination.
     """
     matrix = [list(row) for row in a]
     n = len(matrix)
     for row in matrix:
         if len(row) != n:
-            raise ValueError("solve_linear expects a square matrix")
-
-    if rhs and isinstance(rhs[0], (list, tuple)):
-        columns = [list(col) for col in rhs]
-    else:
-        columns = [list(rhs)]
-    for col in columns:
-        if len(col) != n:
-            raise ValueError("rhs length must match matrix size")
+            raise ValueError("lu_factor expects a square matrix")
 
     scale = 0.0
     for row in matrix:
@@ -45,7 +37,7 @@ def solve_linear(a, rhs):
                 scale = abs(value)
     pivot_tol = n * _EPS * (scale if scale > 0.0 else 1.0)
 
-    # Forward elimination with partial pivoting, applied to every rhs column.
+    swaps = []
     for k in range(n):
         pivot_row = k
         pivot_abs = abs(matrix[k][k])
@@ -61,8 +53,7 @@ def solve_linear(a, rhs):
             )
         if pivot_row != k:
             matrix[k], matrix[pivot_row] = matrix[pivot_row], matrix[k]
-            for col in columns:
-                col[k], col[pivot_row] = col[pivot_row], col[k]
+            swaps.append((k, pivot_row))
 
         pivot = matrix[k][k]
         for i in range(k + 1, n):
@@ -73,10 +64,44 @@ def solve_linear(a, rhs):
             row_k = matrix[k]
             for j in range(k + 1, n):
                 row_i[j] -= factor * row_k[j]
-            row_i[k] = 0.0
-            for col in columns:
-                col[i] -= factor * col[k]
+            row_i[k] = factor  # store the L multiplier below the diagonal
 
+    return {"lu": matrix, "swaps": swaps, "n": n, "pivot_tol": pivot_tol}
+
+
+def lu_solve(factor, rhs):
+    """Solve ``a @ x = rhs`` using a factorisation from `lu_factor`.
+
+    ``rhs`` is a flat sequence (returns a flat list) or a sequence of equal
+    length columns (returns a list of flat solution lists).  The factorisation
+    is never modified, so one cached factor can serve repeated target updates.
+    """
+    matrix = factor["lu"]
+    n = factor["n"]
+
+    if rhs and isinstance(rhs[0], (list, tuple)):
+        columns = [list(col) for col in rhs]
+    else:
+        columns = [list(rhs)]
+    for col in columns:
+        if len(col) != n:
+            raise ValueError("rhs length must match matrix size")
+
+    # Apply the recorded pivot row swaps to every rhs column.
+    for r0, r1 in factor["swaps"]:
+        for col in columns:
+            col[r0], col[r1] = col[r1], col[r0]
+
+    # Forward substitution: L y = P b, with unit diagonal in L.
+    for k in range(n):
+        row_k = matrix[k]
+        for col in columns:
+            for i in range(k + 1, n):
+                multiplier = matrix[i][k]
+                if multiplier != 0.0:
+                    col[i] -= multiplier * col[k]
+
+    # Back substitution: U x = y.
     solutions = []
     for col in columns:
         x = [0.0] * n
@@ -89,6 +114,19 @@ def solve_linear(a, rhs):
         solutions.append(x)
 
     return solutions[0] if len(solutions) == 1 else solutions
+
+
+def solve_linear(a, rhs):
+    """Solve ``a @ x = rhs`` for one or several right-hand sides.
+
+    ``a`` is an n x n matrix (list of lists), ``rhs`` is either a flat
+    sequence (returns a flat list) or a sequence of equal-length columns
+    (returns a list of flat solution lists).  Inputs are copied; the caller's
+    matrices are never modified.
+
+    A pivot no larger than ``n * eps * max|a_ij|`` is treated as singular.
+    """
+    return lu_solve(lu_factor(a), rhs)
 
 
 def affine_rank(mat, tol=1e-12):

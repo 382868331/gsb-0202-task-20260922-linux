@@ -11,7 +11,7 @@
 - 网络 / 账号 / 密钥 / 数据库 / 中间件 / 云 API / Docker：均不需要
 
 ```bash
-# 必要测试（38 个用例）
+# 必要测试（46 个用例）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（约 0.03 秒，上限要求约 8 秒内）
@@ -49,6 +49,22 @@ from tps2d import fit, TPSInputError, DegeneratePointsError, MAX_CONTROL_POINTS
 result = fit(sources, targets, lam=0.0)
 ```
 
+当源控制点与正则参数不变、只反复修改目标位置（例如交互拖拽）时，使用有状态的
+`TPSFitter` 复用所有与目标无关的计算（校验、去重、归一化、仿射秩、矩阵组装、
+LU 分解、弯曲能核表），每次只重新代入右端项：
+
+```python
+from tps2d import TPSFitter
+
+fitter = TPSFitter(sources, lam=0.0)   # 只与 sources / lam 相关，构建一次
+result = fitter.fit(targets_1)         # 首次目标求解，result.reused 记录复用步骤
+result = fitter.fit(targets_2)         # 仅替换右端项，LU 分解等全部复用
+# fitter.result / fitter.warp 保存上一份有效结果；失败的更新不会替换它们
+```
+
+源位置或 `lam` 改变即属于新问题，需要构造新的 `TPSFitter`——本接口不提供原地
+修改源点的途径，因此旧分解不可能被错误复用。
+
 - `sources` / `targets`：`list[list[float, float]]`，长度 1～40 且相等。
 - `lam`：正则参数，实数，`lam >= 0`，量纲为**长度²**（与 K 中 r² 对应）。
   `lam=0` 精确插值；增大则以拟合残差换平滑。同一形变在坐标整体放大 s 倍时，
@@ -67,6 +83,7 @@ result = fit(sources, targets, lam=0.0)
 | `bending_energy` | 弯曲能二次型 `wᵀKw`，两输出坐标求和；纯仿射时为 0 |
 | `rank` | 仿射设计矩阵 P 的数值秩（合法拟合恒为 3） |
 | `merged_count` | 合并同目标重复点后的不同源点个数 |
+| `reused` | 本次拟合实际复用的计算名称元组；`TPSFitter.fit` 为全部源/λ相关步骤，一次性 `fit` 恒为 `()` |
 
 `TPSWarp` 方法：
 
@@ -79,6 +96,11 @@ warp.jacobian([x, y])          # -> 2×2 [[dfx/dx, dfx/dy],[dfy/dx, dfy/dy]]
 
 Jacobian 由核函数解析导数给出：`∂U/∂x = dx·(ln r² + 1)`，在控制点处（r=0）
 方向导数取 0，结果有限。
+
+`TPSFitter` 还提供 `sources`、`control_points`（合并后）、`lam`、`rank`、
+`merged_count`、`result`、`warp`、`cached_computations()`、`fit(targets)` 与
+`update_targets(targets)`（`fit` 的别名）。构造时也可直接传 `targets=` 完成首次
+拟合；源构型退化或非法输入在构造阶段即报错。
 
 ## 错误语义（非法输入不静默纠正）
 
@@ -121,7 +143,10 @@ IEEE-754 binary64（双精度），部分主元高斯消元。测试断言口径
 
 - **自带稠密线性求解器**（`tps2d/_linalg.py`）：系统最大 43 阶，纯 Python O(n³)
   消元耗时为毫秒级，换取零依赖、可审计；
-- 两输出坐标共用同一次消元（多右端项），不重复分解；
+- 两输出坐标共用同一次消元（多右端项），不重复分解；求解器拆分为
+  `lu_factor`（一次部分主元 LU 分解，输出可缓存）与 `lu_solve`（对任意多个
+  右端项复用同一分解）；`TPSFitter` 在源点/λ 不变时只做一次分解，目标拖拽
+  仅付出右端项前代/回代代价；
 - **内部归一化**：求解前把源点中心化并按点集直径 s 缩放到 [-1,1] 量级，
   目标点除以 s，正则量换算为 `lam/s²`，求解后再把系数精确换回原单位
   （利用 `U(sr)=s²U(r)+s²ln(s)r²` 与 `Pᵀw=0`，二次附加项退化为并入 a0 的
@@ -133,6 +158,7 @@ IEEE-754 binary64（双精度），部分主元高斯消元。测试断言口径
 - 测试期望值来自闭式构造（已知仿射）或 `tests/_reference.py` 中**从零另写**
   的独立参考（独立核函数、独立 Gauss-Jordan 消元、独立组装），被测核心
   从不用于产生自己的期望值；往返一致性检查仅作补充；
+  缓存复用结果同样逐分量与一次性 `fit`/独立参考对齐，复用不得改变数值；
 - 不提供图像重采样 / 浏览器 / GUI，本模块只做点对曲面的 fit、warp 与导数。
 
 ## 已知限制
@@ -149,7 +175,7 @@ IEEE-754 binary64（双精度），部分主元高斯消元。测试断言口径
 tps2d/__init__.py     # 公开接口
 tps2d/core.py         # 校验、核函数、fit/warp/Jacobian/残差/弯曲能
 tps2d/_linalg.py      # 部分主元高斯消元 + 仿射秩
-tests/test_tps.py     # 38 个必要测试
+tests/test_tps.py     # 46 个必要测试
 tests/_reference.py   # 仅供测试的独立参考实现
 demo.py               # 固定输入演示（正常结果 + 实际触发的拒绝）
 ```

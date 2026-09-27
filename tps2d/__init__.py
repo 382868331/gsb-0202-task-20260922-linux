@@ -6,6 +6,7 @@ from .core import (
     DegeneratePointsError,
     TPSFitResult,
     TPSWarp,
+    TPSFitter,
     fit,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "DegeneratePointsError",
     "TPSFitResult",
     "TPSWarp",
+    "TPSFitter",
     "fit",
 ]

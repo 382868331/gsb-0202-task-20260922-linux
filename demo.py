@@ -11,7 +11,7 @@ two conflicting targets).
 import math
 import time
 
-from tps2d import fit, TPSInputError
+from tps2d import fit, TPSFitter, TPSInputError
 
 
 def build_problem():
@@ -73,9 +73,42 @@ def main():
     )
     print(f"\nmax |J_analytic - J_finite-diff| at {p}: {err:.3e}")
 
+    # ---- source/lambda cache reuse across target drags ---------------
+    print("\n=== source/lambda cache reuse: targets changed only ===")
+    bad_sources = [[0, 0], [3, 0], [0, 3], [3, 0]]
+    bad_targets = [[0, 0], [3, 1], [1, 3], [3, 1]]
+    fitter = TPSFitter(sources, lam=0.0)
+    r_first = fitter.fit(targets)
+    moved = [
+        [x + 0.8 * math.sin(0.3 * y + 1.0), y - 0.7 * math.cos(0.25 * x)]
+        for x, y in sources
+    ]
+    r_drag = fitter.fit(moved)
+    print(f"reused computations: {', '.join(r_drag.reused)}")
+    one_shot = fit(sources, moved, lam=0.0)
+    drift = max(
+        abs(r_drag.weights[i][c] - one_shot.weights[i][c])
+        for i in range(len(r_drag.weights)) for c in range(2)
+    )
+    print(f"max weight difference vs independent fit: {drift:.3e}")
+    # duplicate source (3,0) maps to conflicting targets
+    try:
+        bad_fitter = TPSFitter(bad_sources, lam=0.0, targets=bad_targets)
+        bad_fitter.fit([[0, 0], [3.1, 1.0], [1.0, 3.0], [3.0, 2.0]])
+    except TPSInputError as exc:
+        print(f"failed target update rejected: {exc}")
+    # A failed update on the real fitter leaves the previous warp usable.
+    before = fitter.result.warp.evaluate(probes[1])
+    try:
+        fitter.fit([[0, 0]] * (len(sources) - 1))  # wrong length
+    except TPSInputError as exc:
+        print(f"bad drag rejected, previous warp kept: {exc}")
+    after = fitter.result.warp.evaluate(probes[1])
+    same = abs(after[0] - before[0]) + abs(after[1] - before[1])
+    print(f"previous warp unchanged after failed update (|delta|={same:.0e})")
+
     # ---- a boundary that actually fires -------------------------------
     print("\n=== contract boundary: conflicting duplicate source ===")
-    bad_sources = [[0, 0], [3, 0], [0, 3], [3, 0]]
     bad_targets = [[0, 0], [3, 1], [1, 3], [3, 2]]  # point (3,0) twice, different
     try:
         fit(bad_sources, bad_targets)

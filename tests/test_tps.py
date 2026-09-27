@@ -15,9 +15,20 @@ import math
 import unittest
 
 import tps2d
-from tps2d import fit, TPSInputError, DegeneratePointsError, MAX_CONTROL_POINTS
+from tps2d import (
+    fit,
+    TPSFitter,
+    TPSInputError,
+    DegeneratePointsError,
+    MAX_CONTROL_POINTS,
+)
 
-from _reference import reference_fit, reference_warp, finite_diff_jacobian, kernel
+from _reference import (
+    reference_fit,
+    reference_warp,
+    finite_diff_jacobian,
+    kernel,
+)
 
 
 def grid_points(nx=4, ny=4, scale=3.0):
@@ -368,6 +379,155 @@ class KernelConventionTests(unittest.TestCase):
         self.assertTrue(all(math.isfinite(v) for v in out))
         self.assertAlmostEqual(out[0], 0.5, delta=1e-9)
         self.assertAlmostEqual(out[1], -0.5, delta=1e-9)
+
+
+def _fit_attrs(result):
+    """Numerically comparable attributes of a fit result."""
+    return (
+        [row[:] for row in result.weights],
+        [row[:] for row in result.affine],
+        result.residuals[:],
+        result.rms_residual,
+        result.bending_energy,
+        result.rank,
+        result.merged_count,
+    )
+
+
+class CachedSourceReuseTests(unittest.TestCase):
+    """TPSFitter must reuse source/lambda work across target-only refits."""
+
+    def setUp(self):
+        self.src = grid_points(4, 4)
+        self.tgt1 = [
+            [x + 0.4 * math.sin(0.5 * y), y + 0.3 * math.cos(0.4 * x)]
+            for x, y in self.src
+        ]
+        self.tgt2 = [
+            [x + 0.2 * math.sin(0.7 * y + 1.0), y - 0.35 * math.cos(0.3 * x)]
+            for x, y in self.src
+        ]
+
+    def test_refit_matches_independent_one_shot_fit(self):
+        fitter = TPSFitter(self.src, lam=0.5, targets=self.tgt1)
+        r1 = fitter.result
+        r2 = fitter.fit(self.tgt2)
+        for result, tgt in ((r1, self.tgt1), (r2, self.tgt2)):
+            expected = fit(self.src, tgt, lam=0.5)
+            for a, b in zip(_fit_attrs(result), _fit_attrs(expected)):
+                if isinstance(a, list):
+                    for ra, rb in zip(a, b):
+                        if isinstance(ra, list):
+                            for xa, xb in zip(ra, rb):
+                                self.assertAlmostEqual(xa, xb, delta=1e-10)
+                        else:
+                            self.assertAlmostEqual(ra, rb, delta=1e-10)
+                else:
+                    self.assertAlmostEqual(a, b, delta=1e-10)
+            # Warp output agrees at non-control probe points too.
+            for p in [[0.3, 1.1], [4.7, 5.9], [-3.0, 8.0], [9.2, -1.5]]:
+                qa = result.warp.evaluate(p)
+                qb = expected.warp.evaluate(p)
+                self.assertAlmostEqual(qa[0], qb[0], delta=1e-10)
+                self.assertAlmostEqual(qa[1], qb[1], delta=1e-10)
+
+    def test_reused_steps_recorded(self):
+        fitter = TPSFitter(self.src, lam=0.0)
+        r1 = fitter.fit(self.tgt1)
+        self.assertEqual(
+            set(r1.reused), set(fitter.cached_computations())
+        )
+        r2 = fitter.fit(self.tgt2)
+        self.assertEqual(r2.reused, r1.reused)
+        self.assertIn("lu_factorization", r2.reused)
+        self.assertIn("system_matrix_assembly", r2.reused)
+        # The one-shot stateless API performs no reuse.
+        self.assertEqual(fit(self.src, self.tgt1).reused, ())
+
+    def test_actual_lu_factor_is_shared(self):
+        fitter = TPSFitter(self.src, lam=1.25)
+        fitter.fit(self.tgt1)
+        factor = fitter._model["factor"]
+        fitter.fit(self.tgt2)
+        self.assertIs(fitter._model["factor"], factor)
+
+    def test_failed_update_keeps_previous_valid_warp(self):
+        fitter = TPSFitter(self.src, lam=0.0, targets=self.tgt1)
+        good = fitter.result
+        # Conflicting duplicate targets: rejected, and old warp survives.
+        bad_sources = [[0, 0], [1, 0], [0, 1], [1, 0]]
+        f2 = TPSFitter(bad_sources, lam=0.0, targets=[[0, 0], [2, 0], [0, 2], [2, 0]])
+        self.assertAlmostEqual(f2.warp.evaluate([1, 0])[0], 2.0, delta=1e-9)
+        with self.assertRaises(TPSInputError):
+            f2.fit([[0, 0], [2.1, 0], [0, 2], [2.9, 0]])
+        self.assertIs(f2.result.warp, f2.warp)
+        self.assertAlmostEqual(f2.warp.evaluate([1, 0])[0], 2.0, delta=1e-9)
+
+        # Bad shape / non-finite / wrong length likewise leave state intact.
+        for bad_targets in (
+            [[0, 0]],
+            [[t[0], t[1], 0.0] for t in self.tgt1],
+            [[float("nan"), 0.0]] + self.tgt1[1:],
+        ):
+            with self.assertRaises(TPSInputError):
+                fitter.fit(bad_targets)
+            self.assertIs(fitter.result, good)
+            q = fitter.warp.evaluate([0.5, 0.7])
+            q0 = good.warp.evaluate([0.5, 0.7])
+            self.assertEqual(q, q0)
+
+    def test_lambda_change_requires_new_cache(self):
+        fitter = TPSFitter(self.src, lam=1.0, targets=self.tgt1)
+        factor = fitter._model["factor"]
+        # A different regularisation is a different problem: no mutator can
+        # reuse the old factor, and a new fitter gives the fresh one-shot fit.
+        fresh = TPSFitter(self.src, lam=4.0)
+        fresh.fit(self.tgt1)
+        self.assertIsNot(fresh._model["factor"], factor)
+        expected = fit(self.src, self.tgt1, lam=4.0)
+        self.assertAlmostEqual(
+            fresh.result.rms_residual, expected.rms_residual, delta=1e-12
+        )
+
+    def test_source_change_requires_new_cache(self):
+        moved = [list(p) for p in self.src]
+        moved[3] = [moved[3][0] + 0.7, moved[3][1] - 0.4]
+        fitter = TPSFitter(self.src, lam=0.0, targets=self.tgt1)
+        moved_fitter = TPSFitter(moved, lam=0.0)
+        moved_fitter.fit(self.tgt1)
+        self.assertEqual(fitter.merged_count, moved_fitter.merged_count)
+        self.assertNotEqual(
+            fitter.control_points[3], moved_fitter.control_points[3]
+        )
+        expected = fit(moved, self.tgt1, lam=0.0)
+        for p in [[0.3, 1.1], [4.7, 5.9]]:
+            qa = moved_fitter.warp.evaluate(p)
+            qb = expected.warp.evaluate(p)
+            self.assertAlmostEqual(qa[0], qb[0], delta=1e-10)
+            self.assertAlmostEqual(qa[1], qb[1], delta=1e-10)
+
+    def test_duplicate_merge_rule_identical_in_fitter(self):
+        src = [[0, 0], [1, 0], [0, 1], [1, 0]]
+        tgt = [[0, 0], [2, 0], [0, 2], [2, 0]]
+        fitter = TPSFitter(src, lam=0.0)
+        self.assertEqual(fitter.merged_count, 3)
+        res = fitter.fit(tgt)
+        self.assertEqual(res.merged_count, 3)
+        one_shot = fit(src, tgt)
+        self.assertEqual(res.merged_count, one_shot.merged_count)
+        self.assertAlmostEqual(
+            res.warp.evaluate([1, 0])[0],
+            one_shot.warp.evaluate([1, 0])[0],
+            delta=1e-12,
+        )
+
+    def test_constructor_rejects_degenerate_and_bad_sources(self):
+        with self.assertRaises(DegeneratePointsError):
+            TPSFitter([[0, 0], [1, 1], [2, 2]], targets=[[0, 0], [1, 0], [2, 0]])
+        with self.assertRaises(TPSInputError):
+            TPSFitter(self.src, lam=-0.1)
+        with self.assertRaises(TPSInputError):
+            TPSFitter(self.src, lam=True)
 
 
 if __name__ == "__main__":
